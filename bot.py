@@ -38,7 +38,7 @@ import time
 from abc import ABC, abstractmethod ##test abstractmethod for state system
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.utils.logging_utils import get_logger
-from rlgym.utils.obs_builders.advanced_obs import AdvancedObs
+from rlgym.utils.obs_builders import AdvancedObs
 from rlbot.utils.structures.quick_chats import QuickChats ##correct quickchat location
 from rlgym.utils.reward_functions.common_rewards import VelocityBallToGoalReward
 from rlbot.utils.structures.ball_prediction_struct import BallPrediction
@@ -184,7 +184,7 @@ def create_rlgym_env(reward_fn=VelocityBallToGoalReward(), terminal_conditions=N
         terminal_conditions = [TimeoutCondition(300), GoalScoredCondition()]
 
     return rlgym.make(
-        obs_builder=AdvancedObs(),  # Advanced observation model for PPO
+        obs_builder=AdvancedObs(),  # Default observation model for PPO
         reward_fn=reward_fn,
         terminal_conditions=terminal_conditions
     )
@@ -192,6 +192,9 @@ def create_rlgym_env(reward_fn=VelocityBallToGoalReward(), terminal_conditions=N
 # Train or load PPO model
 def train_or_load_model(num_iterations):
     env = create_rlgym_env()  # Create the environment
+    
+    # Logging the current observation space for debugging
+    logger.info(f"Current observation space: {env.observation_space}")
     
     try:
         model = PPO.load("trained_model", env=env)  # Provide the environment when loading
