@@ -78,6 +78,10 @@ class GetBoost(BaseState):
         car = packet.game_cars[agent.index]
         boost_pads = packet.game_boost_pads
 
+        # Check for active boost pads
+        if not boost_pads:
+            return None # No boost pads to target 
+
         # Find the closest boost pad
         closest_boost = min(
             (pad for pad in boost_pads if pad.is_active),
@@ -230,6 +234,8 @@ class EchoBot(BaseAgent):
         self.sequence = None  # Sequence to manage complex maneuvers
         self.spike_watcher = SpikeWatcher()  # Initialize SpikeWatcher
         self.state_handler = StateHandler(self)  # Initialize state handler
+        self.goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)
+
 
     def send_quick_chat(self, quick_chat_index):
         team_only = False  # Change to True for team-only messages
@@ -239,6 +245,8 @@ class EchoBot(BaseAgent):
     def initialize_agent(self):
         # Called once when the bot is spawned
         self.initialized = True
+        self.sequence = None
+        self.spike_watcher = SpikeWatcher()  # Initialize SpikeWatcher
 
     def get_observation(self, packet: GameTickPacket):
         # Extract useful features from the packet to feed to the PPO model
@@ -287,9 +295,26 @@ class EchoBot(BaseAgent):
         # Map action predictions to controller output (throttle, steer, etc.)
         self.controller = map_action_to_controls(action)
 
+        try:
+            # Obtain ball prediction and analyze it
+            ball_prediction = self.get_ball_prediction(packet)  # Line of interest
+            
+            future_goal_slice = predict_future_goal(ball_prediction)
+            
+            # If the ball is predicted to enter the goal, adjust the strategy
+            if future_goal_slice is not None:
+                logger.info("The ball is predicted to enter the goal! Adjusting strategy.")
+                self.controller.boost = True  # Example adjustment; you can refine this logic further
+                
+                # Send a quick chat about the prediction
+                self.send_quick_chat(self.quick_chats.Reactions_Noooo)  # Replace with your desired quick chat option
+        except AttributeError as e:
+            logger.warning(f"Ball prediction failed: {e}")
+            ball_prediction = None  # You can also handle this case if needed
+
         # Obtain ball prediction and analyze it
-        ball_prediction = self.get_ball_prediction(packet)
-        future_goal_slice = predict_future_goal(ball_prediction)
+#        ball_prediction = self.get_ball_prediction(packet)
+#        future_goal_slice = predict_future_goal(ball_prediction)
         
         # If the ball is predicted to enter the goal, adjust the strategy
         if future_goal_slice is not None:
@@ -303,7 +328,7 @@ class EchoBot(BaseAgent):
         car = packet.game_cars[self.index]
 
         # Calculate the steering direction towards the ball or goal based on the predicted trajectory
-        target_location = ball_prediction.slices[0].physics.location if ball_prediction.num_slices > 0 else GOAL_LOCATION
+        target_location = ball_prediction.slices[0].physics.location if ball_prediction.num_slices > 0 else goal_location
         self.controller.steer = steer_toward_target(car, target_location)
 
         # If in Rumble mode and the bot is spiking the ball, you could modify the bot's actions here
@@ -311,7 +336,7 @@ class EchoBot(BaseAgent):
             logger.info("The bot is carrying the ball with spikes!")
             # Example behavior modification: aim towards the goal with spiked ball
             self.controller.throttle = 1.0  # Full throttle when carrying the ball
-            self.controller.steer = steer_toward_target(car, GOAL_LOCATION)  # Aim towards the goal
+            self.controller.steer = steer_toward_target(car, goal_location)  # Aim towards the goal
 
         # Log the current state for debugging
         logger.info(f"Current state: {self.state}")
@@ -346,12 +371,13 @@ class EchoBot(BaseAgent):
         # Calculate the vector to the target location
         direction_to_target = location - car_location
         distance_to_target = direction_to_target.magnitude()  # Get the distance to the target location
+        direction_to_target_normalized = direction_to_target.normalized() if distance_to_target > 0 else None
 
         # Normalize the direction vector
-        if distance_to_target > 0:
-            direction_to_target_normalized = direction_to_target.normalized()
-        else:
-            return SimpleControllerState()  # Already at the target location
+#        if distance_to_target > 0:
+#            direction_to_target_normalized = direction_to_target.normalized()
+#        else:
+#            return SimpleControllerState()  # Already at the target location
 
         # Calculate the desired steering angle
         steering_adjustment = steer_toward_target(car, location)
@@ -359,11 +385,12 @@ class EchoBot(BaseAgent):
         # Calculate the car's current speed
         current_speed = car_velocity.magnitude()
 
+        throttle = 1.0 if distance_to_target > 200 else max(0.3, 1.0 - (distance_to_target / 200))
         # Throttle control: Accelerate if far from the target, decelerate if close
-        if distance_to_target > 200:
-            throttle = 1.0  # Full throttle if far away
-        else:
-            throttle = max(0.0, 1.0 - (distance_to_target / 200))  # Gradually reduce throttle as it gets closer
+#        if distance_to_target > 200:
+#            throttle = 1.0  # Full throttle if far away
+#        else:
+#            throttle = max(0.0, 1.0 - (distance_to_target / 200))  # Gradually reduce throttle as it gets closer
 
         # Boost logic
         use_boost = current_speed < self.Supersonic_Speed and car.boost > 20  # Use boost to reach supersonic speed
@@ -402,11 +429,10 @@ class EchoBot(BaseAgent):
         distance_to_goal = car_location.dist(goal_location)
 
         # Check if the ball is near the goal
-        if abs(ball_location.y) > 4600:  # The ball is close to the goal
-            # Determine the best position to move towards
-            target_position = Vec3(ball_location.x, goal_location.y, 0)  # Align with the ball on the X-axis
+        # Optimized target position logic
+        if abs(ball_location.y) > 4600:  
+            target_position = Vec3(ball_location.x, goal_location.y, 0)
         else:
-            # Stay in the middle of the goal
             target_position = Vec3(goal_location.x, goal_location.y, 0)
 
         # Calculate the steering direction to the target position
@@ -449,10 +475,9 @@ class EchoBot(BaseAgent):
             return False  # The ball is behind the bot
 
         # Check if there are opponents close by
-        for opponent in packet.game_cars:
-            if opponent.team != self.team:  # Check only opponents
-                if car_location.dist(Vec3(opponent.physics.location)) < opponent_threshold:
-                    return False  # An opponent is too close to take a shot
+        opponents = [opponent for opponent in packet.game_cars if opponent.team != self.team]
+        if any(car_location.dist(Vec3(opponent.physics.location)) < opponent_threshold for opponent in opponents):
+            return False  # An opponent is too close to take a shot
 
         # Check for clear line to the goal
         if not has_clear_line_to_goal(car, ball_location, goal_location, packet):
@@ -461,13 +486,13 @@ class EchoBot(BaseAgent):
         # If all checks are passed, the bot can take a shot
         return True
     
-    def is_ball_in_front(car, ball_location):
+    def is_ball_in_front(self, car, ball_location):
         """Check if the ball is in front of the car."""
         car_forward = Vec3(car.physics.rotation).forward()  # Get the car's forward vector
         car_to_ball = (ball_location - Vec3(car.physics.location)).normalize()
         return car_forward.dot(car_to_ball) > 0  # Return true if the ball is in front of the car
 
-    def has_clear_line_to_goal(car, ball_location, goal_location, packet):
+    def has_clear_line_to_goal(self, car, ball_location, goal_location, packet):
         """Check if there is a clear line to the goal."""
         # Simple line-of-sight check
         for opponent in packet.game_cars:
@@ -476,15 +501,18 @@ class EchoBot(BaseAgent):
                     return False  # An opponent blocks the line to the goal
         return True
 
-    def intersects(car, ball_location, goal_location, opponent):
+#intersects(car, ball_location, goal_location, opponent)
+    def intersects(self, line_start, line_end, opponent):
         """Determine if a line from the car to the goal intersects with the opponent."""
         # A very simplistic intersection check; can be expanded with actual physics collision checks
         opponent_location = Vec3(opponent.physics.location)
         # Check if the opponent is within a certain distance of the line
-        distance_to_line = distance_from_point_to_line(opponent_location, ball_location, goal_location)
+        #distance_to_line = distance_from_point_to_line(opponent_location, ball_location, goal_location)
+        distance_to_line = self.distance_from_point_to_line(opponent_location, line_start, line_end)
         return distance_to_line < 200  # Arbitrary threshold for intersection
 
-    def distance_from_point_to_line(point, line_start, line_end):
+#distance_from_point_to_line(point, line_start, line_end)
+    def distance_from_point_to_line(self, point, line_start, line_end):
         """Calculate the distance from a point to a line segment."""
         # Vector AB
         ab = line_end - line_start
@@ -530,131 +558,53 @@ class EchoBot(BaseAgent):
         # Implement a basic kick for the ball
         if ball_location.dist(car_location) < 200:  # If close enough to hit the ball
             controller_state.jump = True  # Jump to give a lift to the shot
-            controller_state.boost = True  # Use boost to enhance shot power
+            if car.boost > 30:  # Check if there's enough boost
+                controller_state.boost = True  # Use boost to enhance shot power
 
         return controller_state
 
 
     def chase_ball(self, packet):
-        #GPT code that modified basic chase functionality. Keeping somewhat basic boost management
-#        def chase_ball(self, packet):
-#        #GPT logic for chasing. REVISIT if the bot is dumb about boost or if it chases too much
-#        car = packet.game_cars[self.index]  # Get the bot's car state
-#        ball_location = Vec3(packet.game_ball.physics.location)  # Get the ball's position
-#        car_location = Vec3(car.physics.location)  # Get the car's position
-#        opponent_boost_threshold = 20  # Boost threshold for opponents
-#        team_goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)  # Goal location based on team
-#
-#        # Determine the opponent's boost level
-#        opponent_boost = 0
-#        for opponent in packet.game_cars:
-#            if opponent.team != self.team:  # Check only opponents
-#                opponent_boost = opponent.boost  # Get the opponent's boost level
-#
-#        # Calculate distance to the ball
-#        distance_to_ball = car_location.dist(ball_location)
-#
-#        # Calculate direction towards the ball
-#        direction_to_ball = (ball_location - car_location).normalize()
-#
-#        # Initialize controller state
-#        controller_state = SimpleControllerState()
-#
-#        # Decide boost usage
-#        if car.boost > 50:
-#            controller_state.boost = True  # Use boost until it goes down to 50
-#        elif opponent_boost < opponent_boost_threshold and car.boost > 20:
-#            controller_state.boost = True  # Use boost if opponent has low boost
-#
-#        # Check if the opponent is likely to beat the bot to the ball
-#        opponent_position = None
-#        for opponent in packet.game_cars:
-#            if opponent.team != self.team:  # Find the nearest opponent
-#                opponent_position = Vec3(opponent.physics.location)
-#                break
-#
-#        # Calculate the distance from the opponent to the ball
-#        distance_to_ball_from_opponent = opponent_position.dist(ball_location) if opponent_position else float('inf')
-#
-#        # Check if the bot should prioritize its goal side
-#        if distance_to_ball_from_opponent < distance_to_ball and distance_to_ball_from_opponent < 1000:
-#            # If the opponent is closer to the ball, stay on team goal side
-#            direction_to_goal = (team_goal_location - car_location).normalize()
-#            controller_state.steer = direction_to_goal.x  # Adjust steering to stay goal side
-#
-#        else:
-#            # Otherwise, head straight for the ball
-#            controller_state.steer = direction_to_ball.x  # Steer towards the ball
-#
-#        # Apply throttle to move forward
-#        controller_state.throttle = 1.0  # Full throttle to chase the ball
-#
-#        return controller_state
-        car = packet.game_cars[self.index]  # Get the bot's car state
-        car_location = Vec3(car.physics.location)  # Get the car's position
-        team_goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)  # Goal location based on team
-        controller_state = SimpleControllerState()  # Initialize the controller state
-
-        # Get the ball prediction
-        ball_prediction = self.get_ball_prediction(packet)
-        if not ball_prediction:
-            return controller_state  # If no prediction is available, return neutral
-
-        # Get the predicted future location of the ball (e.g., 1 second into the future)
-        prediction_time = 1.0  # You can adjust this prediction time to be longer/shorter
-        predicted_ball_location = None
-        for slice in ball_prediction.slices:
-            if slice.game_seconds > packet.game_info.seconds_elapsed + prediction_time:
-                predicted_ball_location = Vec3(slice.physics.location)
-                break
-
-        if not predicted_ball_location:
-            return controller_state  # If prediction is not found, return neutral
-
-        # Check the opponent's proximity to the predicted ball location
-        closest_opponent = None
-        closest_opponent_dist = float('inf')
+        car = packet.game_cars[self.index]
+        ball_location = Vec3(packet.game_ball.physics.location)
+        car_location = Vec3(car.physics.location)
+        team_goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)
+        
+        # Calculate distances and directions
+        distance_to_ball = car_location.dist(ball_location)
+        direction_to_ball = (ball_location - car_location).normalize()
+        direction_to_goal = (team_goal_location - car_location).normalize()
+        
+        # Initialize controller state
+        controller_state = SimpleControllerState()
+        
+        # Find closest opponent to the ball
+        closest_opponent_distance = float('inf')
         for opponent in packet.game_cars:
-            if opponent.team != self.team:  # Check only opponents
-                opponent_location = Vec3(opponent.physics.location)
-                opponent_dist = opponent_location.dist(predicted_ball_location)
-                if opponent_dist < closest_opponent_dist:
-                    closest_opponent_dist = opponent_dist
-                    closest_opponent = opponent
-
-        # If the opponent is closer to the predicted ball location, stay on the goal side
-        distance_to_predicted_ball = car_location.dist(predicted_ball_location)
-        if closest_opponent and closest_opponent_dist < distance_to_predicted_ball and closest_opponent_dist < 1000:
-            # If the opponent is closer, position the car between the ball and the goal
-            direction_to_goal = (team_goal_location - car_location).normalize()
-            controller_state.steer = direction_to_goal.x  # Adjust steering to stay goal side
-            controller_state.throttle = 0.5  # Slow down to prepare for 50/50 challenge
+            if opponent.team != self.team:
+                opponent_distance_to_ball = Vec3(opponent.physics.location).dist(ball_location)
+                closest_opponent_distance = min(closest_opponent_distance, opponent_distance_to_ball)
+        
+        # Decide when to boost: if we have enough boost and are significantly further from the ball than our opponent
+        if car.boost > 50 or (car.boost > 20 and distance_to_ball < closest_opponent_distance + 300):
+            controller_state.boost = True
+        
+        # Adjust steering: stay defensive if opponent is closer to the ball than we are
+        if closest_opponent_distance < distance_to_ball and closest_opponent_distance < 1000:
+            controller_state.steer = direction_to_goal.x  # Adjust towards goal side defensively
         else:
-            # Otherwise, chase the ball
-            direction_to_predicted_ball = (predicted_ball_location - car_location).normalize()
-            controller_state.steer = direction_to_predicted_ball.x  # Steer towards the predicted ball location
-            controller_state.throttle = 1.0  # Full throttle to chase
+            controller_state.steer = direction_to_ball.x  # Steer towards the ball if we're clear
 
-        # Boost management
-        if car.boost > 50:
-            controller_state.boost = True  # Use boost until it drops to 50
-        elif closest_opponent and closest_opponent.boost < 20 and car.boost > 20:
-            controller_state.boost = True  # If opponent has low boost, use boost aggressively
-
+        # Apply throttle
+        controller_state.throttle = 1.0
+        
         return controller_state
 
     def get_ball_prediction(self, packet: GameTickPacket, time_horizon: float = 2.0) -> Optional[Vec3]:
         #GPT code for ball prediction. May already be defined REVISIT TO LOOK FOR IT
-        """Args:
-            packet (GameTickPacket): The current game tick packet.
-            time_horizon (float): The future time (in seconds) to check the ball's predicted position.
-        
-        Returns:
-            Optional[Vec3]: The predicted ball position at the given time horizon, or None if unavailable.
-        """
         ball_prediction = packet.ball_prediction  # Get the basic ball prediction
 
-        if ball_prediction is None:
+        if ball_prediction is None or ball_prediction.num_slices == 0:
             return None  # No prediction available
 
         # Iterate through the predicted ball slices to find the one closest to the time horizon
