@@ -1,668 +1,518 @@
-##helpful information for later use
-##class game_object:
-    # This object holds information about the current match
-##    def __init__(self):
-##        self.time = 0
-##        self.time_remaining = 0
-##        self.overtime = False
-##        self.round_active = False
-##        self.kickoff = False
-##        self.match_ended = False
-##        self.friend_score = 0
-##        self.foe_score = 0
-##        self.gravity = Vector()
-##
-##    def update(self, team, packet):
-##        game = packet.game_info
-##        self.time = game.seconds_elapsed
-##        self.time_remaining = game.game_time_remaining
-##        self.overtime = game.is_overtime
-##        self.round_active = game.is_round_active
-##        self.kickoff = game.is_kickoff_pause
-##        self.match_ended = game.is_match_ended
-##        self.friend_score = packet.teams[team].score
-##        self.foe_score = packet.teams[not team].score
-##        self.gravity.z = game.world_gravity_z
-
-
-
 import logging
-import math
 import numpy as np
 import os
-import psutil
-import rlgym
-import signal
-import time
+import re
+import rlgym_sim
 
-from abc import ABC, abstractmethod ##test abstractmethod for state system
-from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
-from rlbot.utils.logging_utils import get_logger
-from rlgym.utils.obs_builders import AdvancedObs
-from rlbot.utils.structures.quick_chats import QuickChats ##correct quickchat location
-from rlgym.utils.reward_functions.common_rewards import VelocityBallToGoalReward
-from rlbot.utils.structures.ball_prediction_struct import BallPrediction
-from rlbot.utils.structures.game_data_struct import GameTickPacket, PlayerInfo
-from rlgym.utils.terminal_conditions.common_conditions import GoalScoredCondition, TimeoutCondition
-from stable_baselines3 import PPO
-from typing import Optional
-from util.ball_prediction_analysis import predict_future_goal  # Importing the prediction function
-from util.orientation import Orientation, relative_location  # Importing the necessary orientation functions
-from util.sequence import Sequence, ControlStep  # Importing the Sequence and ControlStep classes
-from util.spikes import SpikeWatcher  # Importing SpikeWatcher from spikes.py
-from util.vec import Vec3
+from rlgym_ppo import Learner
+from rlgym_ppo.util import MetricsLogger
+from rlgym_sim.utils import common_values, RewardFunction, math
+from rlgym_sim.utils.action_parsers import DiscreteAction
+from rlgym_sim.utils.common_values import *
+from rlgym_sim.utils.gamestates import GameState, PlayerData
+from rlgym_sim.utils.obs_builders import DefaultObs
+from rlgym_sim.utils.reward_functions import CombinedReward, RewardFunction
+from rlgym_sim.utils.reward_functions.common_rewards import *
+from rlgym_sim.utils.state_setters import RandomState
+from rlgym_sim.utils.terminal_conditions.common_conditions import NoTouchTimeoutCondition, GoalScoredCondition
 
-# Set up logging
-logger = get_logger("EchoBotLogs") ##RLBot implementation of logging
+# Set up a logger
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-# Abstract base class for states
-class BaseState(ABC):
-    """Base class that all states should inherit from."""
+class AlignBallGoal(RewardFunction):
+    def __init__(self, defense=1., offense=1.):
+        super().__init__()
+        self.defense = defense
+        self.offense = offense
 
-    @abstractmethod
-    def is_viable(self, agent, packet):
-        """Determines whether the state can run at the moment."""
+    def reset(self, initial_state: GameState):
         pass
 
-    @abstractmethod
-    def get_output(self, agent, packet):
-        """Gets called every frame by the StateHandler until it returns None."""
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        ball = state.ball.position
+        pos = player.car_data.position
+        protecc = np.array(BLUE_GOAL_BACK)
+        attacc = np.array(ORANGE_GOAL_BACK)
+        if player.team_num == ORANGE_TEAM:
+            protecc, attacc = attacc, protecc
+
+        # Align player->ball and net->player vectors
+        defensive_reward = self.defense * math.cosine_similarity(ball - pos, pos - protecc)
+
+        # Align player->ball and player->net vectors
+        offensive_reward = self.offense * math.cosine_similarity(ball - pos, attacc - pos)
+
+        return defensive_reward + offensive_reward
+
+class BallYCoordinateReward(RewardFunction):
+    def __init__(self, exponent=1):
+        # Exponent should be odd so that negative y -> negative reward
+        self.exponent = exponent
+
+    def reset(self, initial_state: GameState):
         pass
 
-# Define specific states
-class GetBoost(BaseState):
-    def is_viable(self, agent, packet):
-        return packet.game_cars[agent.index].boost < 80
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if player.team_num == BLUE_TEAM:
+            return (state.ball.position[1] / (BACK_WALL_Y + BALL_RADIUS)) ** self.exponent
+        else:
+            return (state.inverted_ball.position[1] / (BACK_WALL_Y + BALL_RADIUS)) ** self.exponent
 
-    def get_output(self, agent, packet):
-        car = packet.game_cars[agent.index]
-        boost_pads = packet.game_boost_pads
+class ConditionalRewardFunction(RewardFunction):
+    def __init__(self, reward_func: RewardFunction):
+        super().__init__()
+        self.reward_func = reward_func
 
-        # Check for active boost pads
-        if not boost_pads:
-            return None # No boost pads to target 
+    @abstractmethod
+    def condition(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> bool:
+        raise NotImplementedError
 
-        # Find the closest boost pad
-        closest_boost = min(
-            (pad for pad in boost_pads if pad.is_active),
-            key=lambda pad: Vec3(car.physics.location).dist(Vec3(pad.location)),
-            default=None
-        )
+    def reset(self, initial_state: GameState):
+        pass
 
-        if closest_boost:
-            return agent.go_to_location(Vec3(closest_boost.location))
-        return None  # Still searching for boost
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if self.condition(player, state, previous_action):
+            return self.reward_func.get_reward(player, state, previous_action)
+        return 0
 
+    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if self.condition(player, state, previous_action):
+            return self.reward_func.get_final_reward(player, state, previous_action)
+        return 0
 
-class SaveNet(BaseState):
-    def is_viable(self, agent, packet):
-        return agent.is_ball_heading_to_own_goal(packet)
+class ConstantReward(RewardFunction):
+    def reset(self, initial_state: GameState):
+        pass
 
-    def get_output(self, agent, packet):
-        return agent.defend_goal(packet)
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        return 1
 
+class EventReward(RewardFunction):
+    def __init__(self, goal=0.5, team_goal=0.5, concede=-5, touch=5.0, shot=1.0, save=1.5, demo=0.1, boost_pickup=0.05):
+        """
+        :param goal: reward for goal scored by player.
+        :param team_goal: reward for goal scored by player's team.
+        :param concede: reward for goal scored by opponents. Should be negative if used as punishment.
+        :param touch: reward for touching the ball.
+        :param shot: reward for shooting the ball (as detected by Rocket League).
+        :param save: reward for saving the ball (as detected by Rocket League).
+        :param demo: reward for demolishing a player.
+        :param boost_pickup: reward for picking up boost. big pad = +1.0 boost, small pad = +0.12 boost.
+        """
+        super().__init__()
+        self.weights = np.array([goal, team_goal, concede, touch, shot, save, demo, boost_pickup])
 
-class TakeShot(BaseState):
-    def is_viable(self, agent, packet):
-        return agent.can_take_shot(packet)
-
-    def get_output(self, agent, packet):
-        return agent.take_shot(packet)
-
-
-class ChaseBall(BaseState):
-    def is_viable(self, agent, packet):
-        return True  # Always viable if no other state is viable
-
-    def get_output(self, agent, packet):
-        return agent.chase_ball(packet)
-    
-class StateHandler:
-    def __init__(self, agent):
-        self.agent = agent
-        self.current_state = None
-        self.prev_frame_score = (0, 0)
-
-    def select_state(self, packet):
-        """Chooses the first viable state (determined from is_viable)."""
-        states = [
-            SaveNet(),
-            TakeShot(),
-            GetBoost(),
-            ChaseBall()
-        ]
-
-        for state in states:
-            if state.is_viable(self.agent, packet):
-                self.current_state = state  # Set the current state
-                return state
-        
-        return ChaseBall()  # Default state if none are viable
+        # Need to keep track of last registered value to detect changes
+        self.last_registered_values = {}
 
     @staticmethod
-    def get_goal_score(packet):
-        """Returns a tuple of (blue team goals, orange team goals)."""
-        return packet.teams[0].score, packet.teams[1].score
+    def _extract_values(player: PlayerData, state: GameState):
+        if player.team_num == BLUE_TEAM:
+            team, opponent = state.blue_score, state.orange_score
+        else:
+            team, opponent = state.orange_score, state.blue_score
 
-    def get_output(self, packet):
-        """Returns the output from the current state and selects a new state if needed."""
-        current_frame_score = self.get_goal_score(packet)
+        return np.array([player.match_goals, team, opponent, player.ball_touched, player.match_shots,
+                         player.match_saves, player.match_demolishes, player.boost_amount])
 
-        # Reset state if a goal is scored
-        if current_frame_score != self.prev_frame_score:
-            self.current_state = None
-            self.prev_frame_score = current_frame_score
+    def reset(self, initial_state: GameState, optional_data=None):
+        # Update every reset since rocket league may crash and be restarted with clean values
+        self.last_registered_values = {}
+        for player in initial_state.players:
+            self.last_registered_values[player.car_id] = self._extract_values(player, initial_state)
 
-        # Select a new state if the current one is None
-        if self.current_state is None:
-            self.current_state = self.select_state(packet)
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray, optional_data=None):
+        old_values = self.last_registered_values[player.car_id]
+        new_values = self._extract_values(player, state)
 
-        state_output = self.current_state.get_output(self.agent, packet)
+        diff_values = new_values - old_values
+        diff_values[diff_values < 0] = 0  # We only care about increasing values
 
-        # Return the controller if the state is still running
-        if state_output is not None:
-            return state_output
+        reward = np.dot(self.weights, diff_values)
 
-        # Reset and recurse if the state finished
-        self.current_state = None
-        return self.get_output(packet)
+        self.last_registered_values[player.car_id] = new_values
+        return reward
 
+class FaceBallReward(RewardFunction):
+    def reset(self, initial_state: GameState):
+        pass
 
-def limit_to_safe_range(value: float) -> float:
-    """Ensure values are within the safe range of -1 to 1."""
-    return max(-1, min(1, value))
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        pos_diff = state.ball.position - player.car_data.position
+        norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
+        return float(np.dot(player.car_data.forward(), norm_pos_diff))
 
-def steer_toward_target(car: PlayerInfo, target: Vec3) -> float:
-    """Calculate the steering direction towards a target."""
-    relative = relative_location(Vec3(car.physics.location), Orientation(car.physics.rotation), target)
-    angle = math.atan2(relative.y, relative.x)
-    return limit_to_safe_range(angle * 5)
+class InAirReward(RewardFunction):
+    def __init__(self):
+        super().__init__()
 
-# Create RLGym environment and setup PPO model
-def create_rlgym_env(reward_fn=VelocityBallToGoalReward(), terminal_conditions=None):
-    if terminal_conditions is None:
-        terminal_conditions = [TimeoutCondition(300), GoalScoredCondition()]
+    def reset(self, initial_state: GameState):
+        pass
 
-    return rlgym.make(
-        obs_builder=AdvancedObs(),  # Default observation model for PPO
-        reward_fn=reward_fn,
-        terminal_conditions=terminal_conditions
+    def get_reward(self, player: PlayerData, state: GameState, previous_action) -> float:
+        return 1 if not player.on_ground else 0
+
+class LiuDistanceBallToGoalReward(RewardFunction):
+    def __init__(self, own_goal=False):
+        super().__init__()
+        self.own_goal = own_goal
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if player.team_num == BLUE_TEAM and not self.own_goal \
+                or player.team_num == ORANGE_TEAM and self.own_goal:
+            objective = np.array(ORANGE_GOAL_BACK)
+        else:
+            objective = np.array(BLUE_GOAL_BACK)
+
+        # Compensate for moving objective to back of net
+        dist = np.linalg.norm(state.ball.position - objective) - (BACK_NET_Y - BACK_WALL_Y + BALL_RADIUS)
+        return np.exp(-0.5 * dist / BALL_MAX_SPEED)  # Inspired by https://arxiv.org/abs/2105.12196
+
+class LiuDistancePlayerToBallReward(RewardFunction):
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        # Compensate for inside of ball being unreachable (keep max reward at 1)
+        dist = np.linalg.norm(player.car_data.position - state.ball.position) - BALL_RADIUS
+        return np.exp(-0.5 * dist / CAR_MAX_SPEED)  # Inspired by https://arxiv.org/abs/2105.12196
+
+class RewardIfBehindBall(ConditionalRewardFunction):
+    def condition(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> bool:
+        return player.team_num == BLUE_TEAM and player.car_data.position[1] < state.ball.position[1] \
+               or player.team_num == ORANGE_TEAM and player.car_data.position[1] > state.ball.position[1]
+
+class RewardIfClosestToBall(ConditionalRewardFunction):
+    def __init__(self, reward_func: RewardFunction, team_only=True):
+        super().__init__(reward_func)
+        self.team_only = team_only
+
+    def condition(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> bool:
+        dist = np.linalg.norm(player.car_data.position - state.ball.position)
+        for player2 in state.players:
+            if not self.team_only or player2.team_num == player.team_num:
+                dist2 = np.linalg.norm(player2.car_data.position - state.ball.position)
+                if dist2 < dist:
+                    return False
+        return True
+
+#class RewardIfTouchedLast(ConditionalRewardFunction):
+#    def condition(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> bool:
+#        return state.last_touch == player.car_id
+
+class SaveBoostReward(RewardFunction):
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        # 1 reward for each frame with 100 boost, sqrt because 0->20 makes bigger difference than 80->100
+        return np.sqrt(player.boost_amount)
+
+class SpeedTowardBallReward(RewardFunction):
+    def __init__(self):
+        super().__init__()
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        player_vel = player.car_data.linear_velocity
+        pos_diff = (state.ball.position - player.car_data.position)
+        dist_to_ball = np.linalg.norm(pos_diff)
+
+        if dist_to_ball == 0:  # Avoid division by zero
+            return 0
+
+        dir_to_ball = pos_diff / dist_to_ball
+        speed_toward_ball = np.dot(player_vel, dir_to_ball)
+
+        if speed_toward_ball > 0:
+            return speed_toward_ball / CAR_MAX_SPEED
+        else:
+            return 0
+
+class TouchBallReward(RewardFunction):
+    def __init__(self, aerial_weight=0.):
+        self.aerial_weight = aerial_weight
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if player.ball_touched:
+            # Default just rewards 1, set aerial weight to reward more depending on ball height
+            return ((state.ball.position[2] + BALL_RADIUS) / (2 * BALL_RADIUS)) ** self.aerial_weight
+        return 0
+
+class VelocityBallToGoalReward(RewardFunction):
+    def __init__(self, own_goal=False, use_scalar_projection=False):
+        super().__init__()
+        self.own_goal = own_goal
+        self.use_scalar_projection = use_scalar_projection
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if player.team_num == BLUE_TEAM and not self.own_goal \
+                or player.team_num == ORANGE_TEAM and self.own_goal:
+            objective = np.array(ORANGE_GOAL_BACK)
+        else:
+            objective = np.array(BLUE_GOAL_BACK)
+
+        vel = state.ball.linear_velocity
+        pos_diff = objective - state.ball.position
+        if self.use_scalar_projection:
+            # Vector version of v=d/t <=> t=d/v <=> 1/t=v/d
+            # Max value should be max_speed / ball_radius = 2300 / 94 = 24.5
+            # Used to guide the agent towards the ball
+            inv_t = math.scalar_projection(vel, pos_diff)
+            return inv_t
+        else:
+            # Regular component velocity
+            norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
+            norm_vel = vel / BALL_MAX_SPEED
+            return float(np.dot(norm_pos_diff, norm_vel))
+
+class VelocityPlayerToBallReward(RewardFunction):
+    def __init__(self, use_scalar_projection=False):
+        super().__init__()
+        self.use_scalar_projection = use_scalar_projection
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        vel = player.car_data.linear_velocity
+        pos_diff = state.ball.position - player.car_data.position
+        if self.use_scalar_projection:
+            # Vector version of v=d/t <=> t=d/v <=> 1/t=v/d
+            # Max value should be max_speed / ball_radius = 2300 / 92.75 = 24.8
+            # Used to guide the agent towards the ball
+            inv_t = math.scalar_projection(vel, pos_diff)
+            return inv_t
+        else:
+            # Regular component velocity
+            norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
+            norm_vel = vel / CAR_MAX_SPEED
+            return float(np.dot(norm_pos_diff, norm_vel))
+
+class VelocityReward(RewardFunction):
+    # Simple reward function to ensure the model is training.
+    def __init__(self, negative=False):
+        super().__init__()
+        self.negative = negative
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        return np.linalg.norm(player.car_data.linear_velocity) / CAR_MAX_SPEED * (1 - 2 * self.negative)
+
+class ExampleLogger(MetricsLogger):
+    def _collect_metrics(self, game_state: GameState) -> list:
+        return [game_state.players[0].car_data.linear_velocity,
+                game_state.players[0].car_data.rotation_mtx(),
+                game_state.orange_score]
+
+    def _report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):
+        avg_linvel = np.zeros(3)
+        for metric_array in collected_metrics:
+            p0_linear_velocity = metric_array[0]
+            avg_linvel += p0_linear_velocity
+        avg_linvel /= len(collected_metrics)
+        report = {"x_vel": avg_linvel[0],
+                  "y_vel": avg_linvel[1],
+                  "z_vel": avg_linvel[2],
+                  "Cumulative Timesteps": cumulative_timesteps}
+        wandb_run.log(report)
+
+def build_rocketsim_env():
+#    import rlgym_sim
+#    from rlgym_sim.utils.reward_functions import CombinedReward
+#    from rlgym_sim.utils.reward_functions.common_rewards import VelocityPlayerToBallReward, VelocityBallToGoalReward, \
+#        EventReward
+#    from rlgym_sim.utils.obs_builders import DefaultObs
+#    from rlgym_sim.utils.terminal_conditions.common_conditions import NoTouchTimeoutCondition, GoalScoredCondition
+#    from rlgym_sim.utils import common_values
+#    from rlgym_sim.utils.action_parsers import ContinuousAction
+
+    spawn_opponents = True
+    team_size = 1
+    game_tick_rate = 120
+    tick_skip = 8
+    timeout_seconds = 10
+    timeout_ticks = int(round(timeout_seconds * game_tick_rate / tick_skip))
+
+    # Create action parser without jump action parameter
+    action_parser = DiscreteAction()  # Use default DiscreteAction settings
+
+    terminal_conditions = [NoTouchTimeoutCondition(timeout_ticks), GoalScoredCondition()]
+
+    # Early stage rewards
+    rewards_to_combine = [
+        EventReward(goal=0.5, team_goal=0.5, concede=-5, touch=5.0, shot=1.0, save=1.5, demo=0.1, boost_pickup=0.05),  # Event-based rewards
+        SpeedTowardBallReward(),                 # Speed of car toward the ball
+        FaceBallReward(),                        # Align the car to face the ball
+        InAirReward(),                           # Reward for being in the air
+        VelocityPlayerToBallReward(),            # Speed towards the ball
+        VelocityBallToGoalReward(),              # Speed of the ball toward the goal
+        AlignBallGoal(defense=0.3, offense=0.7), # Alignment with ball towards goal for offense and defense
+        LiuDistancePlayerToBallReward(),         # Distance of player to ball
+        LiuDistanceBallToGoalReward(),           # Distance of ball to goal
+        BallYCoordinateReward(exponent=1),       # Ball's y-coordinate position
+        SaveBoostReward(),                       # Reward for boost saving
+        ConstantReward(),                        # Constant reward (e.g., baseline reward)
+        TouchBallReward(aerial_weight=0.5),      # Ball touch reward with aerial factor
+        VelocityReward(negative=False),          # Car's velocity reward
+        RewardIfClosestToBall(reward_func=TouchBallReward(), team_only=True), # Reward if player is closest to the ball
+#        RewardIfTouchedLast(reward_func=TouchBallReward()), # Reward for the last player to touch the ball
+        RewardIfBehindBall(reward_func=FaceBallReward())    # Reward for staying behind the ball based on team
+    ]
+    # Assign example weights based on reward importance (adjust as needed)
+    reward_weights = [
+        5,   # EventReward - Strong reward for touch and save events, etc.
+        0.5,    # SpeedTowardBallReward - Moderate weight to encourage moving toward the ball
+        1,    # FaceBallReward - Lower weight for facing the ball alignment
+        -50, # InAirReward - Low weight for airborne presence
+        0.25,  # VelocityPlayerToBallReward - Slight boost for velocity toward ball
+        1,  # VelocityBallToGoalReward - Encourages directing ball toward goal
+        2.5,  # AlignBallGoal - Medium importance for offensive/defensive alignment
+        2,  # LiuDistancePlayerToBallReward - Encourages player to be near the ball
+        1,  # LiuDistanceBallToGoalReward - Encourages ball proximity to goal
+        0.2,  # BallYCoordinateReward - Medium weight for ball y-position
+        20,  # SaveBoostReward - Reward for conserving boost
+        0.001,  # ConstantReward - Baseline reward, low weight
+        20,   # TouchBallReward - Significant reward for touching the ball
+        0.25,  # VelocityReward - Minor boost for car speed
+        2,  # RewardIfClosestToBall - Higher reward if player is closest to the ball
+#        2.0,  # RewardIfTouchedLast - High reward for last touch on the ball
+        2   # RewardIfBehindBall - Reward for positioning behind the ball
+    ]
+    obs_builder = DefaultObs(
+        pos_coef=np.asarray([1 / common_values.SIDE_WALL_X, 1 / common_values.BACK_NET_Y, 1 / common_values.CEILING_Z]),
+        ang_coef=1 / np.pi,
+        lin_vel_coef=1 / common_values.CAR_MAX_SPEED,
+        ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL
     )
 
-# Train or load PPO model
-def train_or_load_model(num_iterations):
-    env = create_rlgym_env()  # Create the environment
-    
-    # Logging the current observation space for debugging
-    logger.info(f"Current observation space: {env.observation_space}")
-    
-    try:
-        model = PPO.load("trained_model", env=env)  # Provide the environment when loading
-        logger.info("Loaded pre-trained model.")
-    except FileNotFoundError:
-        logger.warning("No pre-trained model found, training from scratch...")
-        model = PPO("MlpPolicy", env, verbose=1)
-
-    # Training loop
-    for i in range(num_iterations):
-        logger.info(f"Starting iteration {i + 1} of {num_iterations}...")
-        model.learn(total_timesteps=10000)  # Adjust timesteps per iteration as needed
-
-    model.save("trained_model")  # Save the model after training
-    logger.info("Model saved as 'trained_model'.")
-
-    return model
-
-# Map PPO action to Rocket League controls
-def map_action_to_controls(action):
-    controller_state = SimpleControllerState()
-
-    # Action mapping logic
-    controller_state.throttle = float(action[0])  # Convert to float
-    controller_state.steer = np.clip(float(action[1]), -1.0, 1.0)  # Ensure steer is within bounds
-    controller_state.boost = bool(action[2])
-    controller_state.jump = bool(action[3])
-
-    return controller_state
-
-class EchoBot(BaseAgent):
-
-    Supersonic_Speed = 2200 #Max speed defined
-
-    def __init__(self, name, team, index, model: PPO):
-        super().__init__(name, team, index)
-        self.controller = SimpleControllerState()
-        self.model = model  # PPO model for controlling bot actions
-        self.initialized = False
-        self.sequence = None  # Sequence to manage complex maneuvers
-        self.spike_watcher = SpikeWatcher()  # Initialize SpikeWatcher
-        self.state_handler = StateHandler(self)  # Initialize state handler
-        self.goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)
-
-
-    def send_quick_chat(self, quick_chat_index):
-        team_only = False  # Change to True for team-only messages
-        quick_chat = self.quick_chats[quick_chat_index]
-        self.send_quick_chat(self.game_interface, self.index, self.team, team_only, quick_chat)
-
-    def initialize_agent(self):
-        # Called once when the bot is spawned
-        self.initialized = True
-        self.sequence = None
-        self.spike_watcher = SpikeWatcher()  # Initialize SpikeWatcher
-
-    def get_observation(self, packet: GameTickPacket):
-        # Extract useful features from the packet to feed to the PPO model
-        car = packet.game_cars[self.index]
-        ball = packet.game_ball
-
-        # Example observation: car location, velocity, ball location
-        car_location = Vec3(car.physics.location)
-        car_velocity = Vec3(car.physics.velocity)
-        ball_location = Vec3(ball.physics.location)
-
-        # Build observation as a NumPy array
-        observation = np.array([
-            car_location.x, car_location.y, car_location.z,
-            car_velocity.x, car_velocity.y, car_velocity.z,
-            ball_location.x, ball_location.y, ball_location.z,
-            np.sqrt((car_location.x - ball_location.x) ** 2 + (car_location.y - ball_location.y) ** 2)  # Distance to ball
-        ])
-        
-        return observation
-
-    def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
-        if not self.initialized:
-            self.initialize_agent()
-
-        # Check the game mode to see if it is Rumble
-        is_rumble = packet.game_info.is_rumble
-
-        # Update SpikeWatcher if in Rumble mode
-        if is_rumble:
-            self.spike_watcher.read_packet(packet)
-
-        # Check if we are in a sequence and execute it if so
-        if self.sequence:
-            controls = self.sequence.tick(packet)
-            if controls is not None:
-                return controls
-
-        # Get observation from the game
-        observation = self.get_observation(packet)
-        self.update_state(packet)  # Update state based on current conditions
-
-        # Use PPO model to predict actions
-        action, _ = self.model.predict(observation, deterministic=True)
-
-        # Map action predictions to controller output (throttle, steer, etc.)
-        self.controller = map_action_to_controls(action)
-
-        try:
-            # Obtain ball prediction and analyze it
-            ball_prediction = self.get_ball_prediction(packet)  # Line of interest
-            
-            future_goal_slice = predict_future_goal(ball_prediction)
-            
-            # If the ball is predicted to enter the goal, adjust the strategy
-            if future_goal_slice is not None:
-                logger.info("The ball is predicted to enter the goal! Adjusting strategy.")
-                self.controller.boost = True  # Example adjustment; you can refine this logic further
-                
-                # Send a quick chat about the prediction
-                self.send_quick_chat(self.quick_chats.Reactions_Noooo)  # Replace with your desired quick chat option
-        except AttributeError as e:
-            logger.warning(f"Ball prediction failed: {e}")
-            ball_prediction = None  # You can also handle this case if needed
-
-        # Obtain ball prediction and analyze it
-#        ball_prediction = self.get_ball_prediction(packet)
-#        future_goal_slice = predict_future_goal(ball_prediction)
-        
-        # If the ball is predicted to enter the goal, adjust the strategy
-        if future_goal_slice is not None:
-            logger.info("The ball is predicted to enter the goal! Adjusting strategy.")
-            self.controller.boost = True  # Example adjustment; you can refine this logic further
-            
-            # Send a quick chat about the prediction
-            self.send_quick_chat(self.quick_chats.Reactions_Noooo)  # Replace with your desired quick chat option
-
-        # Get the car's current state
-        car = packet.game_cars[self.index]
-
-        # Calculate the steering direction towards the ball or goal based on the predicted trajectory
-        target_location = ball_prediction.slices[0].physics.location if ball_prediction.num_slices > 0 else goal_location
-        self.controller.steer = steer_toward_target(car, target_location)
-
-        # If in Rumble mode and the bot is spiking the ball, you could modify the bot's actions here
-        if is_rumble and self.spike_watcher.carrying_car == car:
-            logger.info("The bot is carrying the ball with spikes!")
-            # Example behavior modification: aim towards the goal with spiked ball
-            self.controller.throttle = 1.0  # Full throttle when carrying the ball
-            self.controller.steer = steer_toward_target(car, goal_location)  # Aim towards the goal
-
-        # Log the current state for debugging
-        logger.info(f"Current state: {self.state}")
-
-        # Delegate to the state handler
-        output = self.state_handler.get_output(packet)
-
-        # If no output, fall back to PPO model
-        if output is None:
-            observation = self.get_observation(packet)
-            action, _ = self.model.predict(observation, deterministic=True)
-            self.controller = self.map_action_to_controls(action)
-        else:
-            self.controller = output
-
-        return self.controller
-    
-    def map_action_to_controls(self, action):
-        controller_state = SimpleControllerState()
-        controller_state.throttle = float(action[0])
-        controller_state.steer = np.clip(float(action[1]), -1.0, 1.0)
-        controller_state.boost = bool(action[2])
-        controller_state.jump = bool(action[3])
-        return controller_state
-
-    def go_to_location(self, location: Vec3):
-        #GPT logic for going to boost. REVISIT for going for demos
-        car = self.game_interface.get_car(self.index)  # Get the current car state
-        car_location = Vec3(car.physics.location)  # Get the car's current position
-        car_velocity = Vec3(car.physics.velocity)  # Get the car's current velocity
-
-        # Calculate the vector to the target location
-        direction_to_target = location - car_location
-        distance_to_target = direction_to_target.magnitude()  # Get the distance to the target location
-        direction_to_target_normalized = direction_to_target.normalized() if distance_to_target > 0 else None
-
-        # Normalize the direction vector
-#        if distance_to_target > 0:
-#            direction_to_target_normalized = direction_to_target.normalized()
-#        else:
-#            return SimpleControllerState()  # Already at the target location
-
-        # Calculate the desired steering angle
-        steering_adjustment = steer_toward_target(car, location)
-
-        # Calculate the car's current speed
-        current_speed = car_velocity.magnitude()
-
-        throttle = 1.0 if distance_to_target > 200 else max(0.3, 1.0 - (distance_to_target / 200))
-        # Throttle control: Accelerate if far from the target, decelerate if close
-#        if distance_to_target > 200:
-#            throttle = 1.0  # Full throttle if far away
-#        else:
-#            throttle = max(0.0, 1.0 - (distance_to_target / 200))  # Gradually reduce throttle as it gets closer
-
-        # Boost logic
-        use_boost = current_speed < self.Supersonic_Speed and car.boost > 20  # Use boost to reach supersonic speed
-
-        # Check if the car is already supersonic
-        if current_speed >= self.Supersonic_Speed:
-            throttle = 1.0  # Maintain full throttle when supersonic
-
-        # Create the controller state
-        controller_state = SimpleControllerState()
-        controller_state.throttle = throttle
-        controller_state.steer = steering_adjustment
-        controller_state.boost = use_boost
-
-        return controller_state
-
-    def is_ball_heading_to_own_goal(self, packet):
-        """Logic to predict if the ball is heading towards the bot's goal."""
-        ball_location = Vec3(packet.game_ball.physics.location)
-        ball_velocity = Vec3(packet.game_ball.physics.velocity)
-        goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)
-        
-        relative_velocity = ball_location - goal_location
-        return relative_velocity.y < 0 and ball_velocity.y < 0  # Ball is moving towards the own goal
-
-    def defend_goal(self, packet):
-        #GPT logic for basic goal defense. REVISIT for aerial defense, prejumps, backboard saves, squishy save for style
-        car = packet.game_cars[self.index]  # Get the bot's car state
-        ball_location = Vec3(packet.game_ball.physics.location)  # Get the ball's position
-        car_location = Vec3(car.physics.location)  # Get the car's position
-
-        # Define the goal location based on the bot's team
-        goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)
-
-        # Calculate the distance from the car to the goal
-        distance_to_goal = car_location.dist(goal_location)
-
-        # Check if the ball is near the goal
-        # Optimized target position logic
-        if abs(ball_location.y) > 4600:  
-            target_position = Vec3(ball_location.x, goal_location.y, 0)
-        else:
-            target_position = Vec3(goal_location.x, goal_location.y, 0)
-
-        # Calculate the steering direction to the target position
-        steer = steer_toward_target(car, target_position)
-
-        # Set throttle and boost based on distance to the goal
-        if distance_to_goal > 500:  # If far from the goal
-            throttle = 1.0  # Full throttle to reach the goal quickly
-        else:
-            throttle = 0.5  # Slow down as we approach
-
-        # Boost logic
-        use_boost = car.boost > 30 and distance_to_goal > 500  # Use boost if far from the goal
-
-        # Create the controller state to return
-        controller_state = SimpleControllerState()
-        controller_state.throttle = throttle
-        controller_state.steer = steer
-        controller_state.boost = use_boost
-
-        return controller_state
-
-    def can_take_shot(self, packet):
-        #GPT code to determine if bot can shoot or if it's beneficial not to. REVISIT to give the bot choices if it should dribble, aerial play, wall pinch or else
-        car = packet.game_cars[self.index]  # Get the bot's car state
-        ball_location = Vec3(packet.game_ball.physics.location)  # Get the ball's position
-        car_location = Vec3(car.physics.location)  # Get the car's position
-
-        # Define some parameters
-        shot_range = 2000  # Maximum distance to consider for a shot
-        opponent_threshold = 1500  # Minimum distance from an opponent to take a shot
-        goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)  # Goal location based on team
-
-        # Check if the ball is within a reasonable distance to take a shot
-        if car_location.dist(ball_location) > shot_range:
-            return False  # Too far to take a shot
-
-        # Check if the ball is in front of the bot
-        if not is_ball_in_front(car, ball_location):
-            return False  # The ball is behind the bot
-
-        # Check if there are opponents close by
-        opponents = [opponent for opponent in packet.game_cars if opponent.team != self.team]
-        if any(car_location.dist(Vec3(opponent.physics.location)) < opponent_threshold for opponent in opponents):
-            return False  # An opponent is too close to take a shot
-
-        # Check for clear line to the goal
-        if not has_clear_line_to_goal(car, ball_location, goal_location, packet):
-            return False  # No clear line to the goal
-
-        # If all checks are passed, the bot can take a shot
-        return True
-    
-    def is_ball_in_front(self, car, ball_location):
-        """Check if the ball is in front of the car."""
-        car_forward = Vec3(car.physics.rotation).forward()  # Get the car's forward vector
-        car_to_ball = (ball_location - Vec3(car.physics.location)).normalize()
-        return car_forward.dot(car_to_ball) > 0  # Return true if the ball is in front of the car
-
-    def has_clear_line_to_goal(self, car, ball_location, goal_location, packet):
-        """Check if there is a clear line to the goal."""
-        # Simple line-of-sight check
-        for opponent in packet.game_cars:
-            if opponent.team != car.team:  # Check only opponents
-                if intersects(car, ball_location, goal_location, opponent):
-                    return False  # An opponent blocks the line to the goal
-        return True
-
-#intersects(car, ball_location, goal_location, opponent)
-    def intersects(self, line_start, line_end, opponent):
-        """Determine if a line from the car to the goal intersects with the opponent."""
-        # A very simplistic intersection check; can be expanded with actual physics collision checks
-        opponent_location = Vec3(opponent.physics.location)
-        # Check if the opponent is within a certain distance of the line
-        #distance_to_line = distance_from_point_to_line(opponent_location, ball_location, goal_location)
-        distance_to_line = self.distance_from_point_to_line(opponent_location, line_start, line_end)
-        return distance_to_line < 200  # Arbitrary threshold for intersection
-
-#distance_from_point_to_line(point, line_start, line_end)
-    def distance_from_point_to_line(self, point, line_start, line_end):
-        """Calculate the distance from a point to a line segment."""
-        # Vector AB
-        ab = line_end - line_start
-        # Vector AC
-        ac = point - line_start
-        # Calculate the area of the triangle formed by points A, B, and C
-        area = abs(ab.x * ac.y - ab.y * ac.x)
-        # Length of line AB
-        length_ab = ab.length()
-        return area / length_ab if length_ab > 0 else 0  # Avoid division by zero
-
-
-    def take_shot(self, packet):
-        #GPT code for a basic shot, REVISIT as im sure it has no idea how physics works and how power shots work, determine what shot is better and execute, opponent distance?
-        car = packet.game_cars[self.index]  # Get the bot's car state
-        ball_location = Vec3(packet.game_ball.physics.location)  # Get the ball's position
-        car_location = Vec3(car.physics.location)  # Get the car's position
-        goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)  # Goal location based on team
-
-        # Determine the distance to the goal
-        distance_to_goal = car_location.dist(goal_location)
-
-        # Calculate a shot direction towards the goal
-        shot_direction = (goal_location - ball_location).normalize()
-
-        # Basic decision making
-        shot_power = 1.0  # Default power; will adjust based on distance
-        if distance_to_goal < 1000:
-            shot_power = 1.0  # Full power for shots close to the goal
-        elif distance_to_goal < 2000:
-            shot_power = 0.8  # Moderate power for mid-range shots
-        else:
-            shot_power = 0.5  # Less power for long-distance shots
-
-        # Create a controller state for the shot
-        controller_state = SimpleControllerState()
-        controller_state.throttle = shot_power  # Set throttle for shot power
-        controller_state.steer = shot_direction.x  # Steer towards the goal
-        controller_state.pitch = 0  # Level the car
-        controller_state.yaw = 0  # Keep the car facing forward (or adjust as needed)
-        controller_state.roll = 0  # No roll for a simple shot
-
-        # Implement a basic kick for the ball
-        if ball_location.dist(car_location) < 200:  # If close enough to hit the ball
-            controller_state.jump = True  # Jump to give a lift to the shot
-            if car.boost > 30:  # Check if there's enough boost
-                controller_state.boost = True  # Use boost to enhance shot power
-
-        return controller_state
-
-
-    def chase_ball(self, packet):
-        car = packet.game_cars[self.index]
-        ball_location = Vec3(packet.game_ball.physics.location)
-        car_location = Vec3(car.physics.location)
-        team_goal_location = Vec3(0, -5100, 0) if self.team == 0 else Vec3(0, 5100, 0)
-        
-        # Calculate distances and directions
-        distance_to_ball = car_location.dist(ball_location)
-        direction_to_ball = (ball_location - car_location).normalize()
-        direction_to_goal = (team_goal_location - car_location).normalize()
-        
-        # Initialize controller state
-        controller_state = SimpleControllerState()
-        
-        # Find closest opponent to the ball
-        closest_opponent_distance = float('inf')
-        for opponent in packet.game_cars:
-            if opponent.team != self.team:
-                opponent_distance_to_ball = Vec3(opponent.physics.location).dist(ball_location)
-                closest_opponent_distance = min(closest_opponent_distance, opponent_distance_to_ball)
-        
-        # Decide when to boost: if we have enough boost and are significantly further from the ball than our opponent
-        if car.boost > 50 or (car.boost > 20 and distance_to_ball < closest_opponent_distance + 300):
-            controller_state.boost = True
-        
-        # Adjust steering: stay defensive if opponent is closer to the ball than we are
-        if closest_opponent_distance < distance_to_ball and closest_opponent_distance < 1000:
-            controller_state.steer = direction_to_goal.x  # Adjust towards goal side defensively
-        else:
-            controller_state.steer = direction_to_ball.x  # Steer towards the ball if we're clear
-
-        # Apply throttle
-        controller_state.throttle = 1.0
-        
-        return controller_state
-
-    def get_ball_prediction(self, packet: GameTickPacket, time_horizon: float = 2.0) -> Optional[Vec3]:
-        #GPT code for ball prediction. May already be defined REVISIT TO LOOK FOR IT
-        ball_prediction = packet.ball_prediction  # Get the basic ball prediction
-
-        if ball_prediction is None or ball_prediction.num_slices == 0:
-            return None  # No prediction available
-
-        # Iterate through the predicted ball slices to find the one closest to the time horizon
-        for i in range(ball_prediction.num_slices):
-            ball_slice = ball_prediction.slices[i]  # Get each future ball state
-            if ball_slice.game_seconds >= packet.game_info.seconds_elapsed + time_horizon:
-                # Return the predicted position at the time_horizon (convert to Vec3 for custom use)
-                return Vec3(ball_slice.physics.location)
-
-        # If no slice matches the time horizon, return the latest available prediction
-        return Vec3(ball_prediction.slices[-1].physics.location) if ball_prediction.num_slices > 0 else None
-
-
-    def start_sequence(self, sequence: Sequence):
-        """ Start a new sequence of actions. """
-        self.sequence = sequence
-
-# Load or train the model, then instantiate the bot with the model
+    state_setter = RandomState(ball_rand_speed=True, cars_rand_speed=True, cars_on_ground=False)
+
+    env = rlgym_sim.make(
+        tick_skip=tick_skip,
+        team_size=team_size,
+        spawn_opponents=spawn_opponents,
+        terminal_conditions=terminal_conditions,
+        reward_fn=CombinedReward(reward_functions=rewards_to_combine, reward_weights=reward_weights),
+        obs_builder=obs_builder,
+        action_parser=action_parser,
+        state_setter=state_setter
+    )
+
+    return env
 if __name__ == "__main__":
-    while True:  # Loop until a valid input is received
-        mode = input("Would you like to (1) Train the bot or (2) Play against the bot? (Enter 1 or 2): ")
-        if mode not in ['1', '2']:
-            logger.error("Invalid input! Please enter 1 for training or 2 for playing against the bot.")
-            continue  # Prompt the user again
-        break  # Exit the loop if valid input is received
+    # Start logging the main execution
+    logger.info("Starting main execution.")
 
-    if mode == '1':  # If training mode
-        while True:  # Loop until a valid input is received
-            try:
-                num_iterations = int(input("Enter the number of training iterations (positive integer): "))
-                if num_iterations <= 0:  # Check for negative or zero
-                    logger.warning("Please enter a positive integer greater than 0.")
-                    continue  # Prompt the user again
-                break  # Exit the loop if valid input is received
-            except ValueError:
-                logger.error("Invalid input! Please enter a valid positive integer.")
+    # Initialize logger for metrics
+    metrics_logger = ExampleLogger()
+    logger.debug("Initialized metrics logger.")
 
-        model = train_or_load_model(num_iterations)
+    # Checkpoint directory setup
+    checkpoint_dir = os.path.join("data", "checkpoints")
+    logger.debug(f"Checkpoint directory set to: {checkpoint_dir}")
 
-        # Instantiate the bot with the trained model
-        bot = EchoBot(name="EchoBot", team=0, index=0, model=model)
+    if not os.path.exists(checkpoint_dir):
+        logger.info(f"Checkpoint directory {checkpoint_dir} does not exist. Creating it.")
+        os.makedirs(checkpoint_dir)
 
-        logger.info("Training complete. Exiting the game...")
+    # Default the policy file path to None
+    policy_file_path = None
 
-        def exit_game():
-            """ Exit the Rocket League game cleanly. """
-            for proc in psutil.process_iter(['name']):
-                if proc.info['name'] == 'RocketLeague.exe':
-                    proc.terminate()  # Terminate the game process
-                    logger.info("Rocket League has been terminated.")
+    # Check for existing checkpoints with additional logging
+    checkpoint_files = os.listdir(checkpoint_dir)
+    logger.debug(f"Files found in checkpoint directory: {checkpoint_files}")
 
-        exit_game()  # Call the exit function
-        import sys
-        sys.exit(0)  # Exit the script
+    if checkpoint_files:
+        try:
+            # Filtering directories matching 'rlgym-ppo-run-<number>'
+            numeric_checkpoints = [
+                d for d in checkpoint_files if re.match(r"rlgym-ppo-run-\d+$", d)
+            ]
+            logger.debug(f"Numeric checkpoint directories found: {numeric_checkpoints}")
 
-    elif mode == '2':  # If playing against the bot
-        logger.info("Launching GUI to play against the bot...")
-        os.system("python run_gui.py")  # Launch the GUI script
+            if numeric_checkpoints:
+                # Sort based on the numeric suffix
+                latest_checkpoint = max(
+                    numeric_checkpoints, key=lambda d: int(d.split("-")[-1])
+                )
+                checkpoint_load_folder = os.path.join(checkpoint_dir, latest_checkpoint)
+                logger.info(f"Found latest checkpoint: {latest_checkpoint}")
+
+                # Now, search for the PPO_POLICY.pt file in subdirectories
+                for root, dirs, files in os.walk(checkpoint_load_folder):
+                    if "PPO_POLICY.pt" in files:
+                        policy_file_path = os.path.join(root, "PPO_POLICY.pt")
+                        logger.info(f"Loaded policy file from: {policy_file_path}")
+                        break
+
+                if policy_file_path is None:
+                    logger.error(f"Checkpoint file PPO_POLICY.pt does not exist in {checkpoint_load_folder}. Cannot load checkpoint.")
+                    checkpoint_load_folder = None
+            else:
+                logger.info("No valid numeric checkpoint directories found.")
+                checkpoint_load_folder = None
+        except ValueError as e:
+            logger.error("Error parsing checkpoint directories.", exc_info=True)
+            checkpoint_load_folder = None
+    else:
+        checkpoint_load_folder = None
+        logger.info("No checkpoints found, starting from scratch.")
+
+    # Number of processes and inference size setup
+    n_proc = 32
+    min_inference_size = max(1, int(round(n_proc * 0.9)))
+    logger.debug(f"Number of processes: {n_proc}")
+    logger.debug(f"Minimum inference size: {min_inference_size}")
+
+    # Ask user for rendering option
+    render_input = input("Do you want to enable rendering? (y/n): ").strip().lower()
+    render = render_input == 'y'  # Set render to True if user inputs 'y'
+    logger.info(f"Rendering enabled: {render}")
+
+    # Initialize the learner with detailed configuration logging
+    logger.debug("Initializing learner with configuration.")
+    learner = Learner(
+        build_rocketsim_env,
+        checkpoint_load_folder=policy_file_path,  # Pass the correct path to the policy file
+        critic_lr=2e-4,
+        exp_buffer_size=300000,
+        log_to_wandb=True,
+        metrics_logger=metrics_logger,
+        min_inference_size=min_inference_size,
+        n_proc=n_proc,
+        policy_lr=2e-4,
+        ppo_batch_size=50000,
+        ppo_ent_coef=0.01,
+        ppo_epochs=3,
+        ppo_minibatch_size=50000,
+        render=render,
+        save_every_ts=100000,
+        standardize_obs=False,
+        standardize_returns=True,
+        timestep_limit=20_000_000,
+        ts_per_iteration=100000, 
+    )
+    logger.info("Learner initialized successfully.")
+
+    # Start the learning process
+    try:
+        logger.info("Starting learning process.")
+        learner.learn()
+        logger.info("Learning process completed.")
+    except Exception as e:
+        logger.error("An error occurred during the learning process.", exc_info=True)
