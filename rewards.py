@@ -1,106 +1,96 @@
 ## Player vars from eventreward bullshit
 #car_id: Unique identifier for each car/player.
 #team_num: The team number (0.0 for one team, 1.0 for the other).
-#match_goals, match_saves, match_shots, match_demolishes: Statistics for that car during the match.
+# match_goals, match_saves, match_shots, match_demolishes:
+# Statistics for that car during the match.
 #boost_pickups: Number of boost pads picked up.
 #is_demoed: Whether the car is demolished (True/False).
 #on_ground: Whether the car is on the ground.
 #ball_touched: Whether the car has touched the ball in this frame.
 #has_jump and has_flip: Whether the car has jump and flip abilities available.
 #boost_amount: Boost level of the car (range: 0 to 1.0).
-#car_data and inverted_car_data: These are PhysicsObject instances representing the car's physical state and its state in the opponent's perspective.
+# car_data and inverted_car_data: These are PhysicsObject instances representing
+# the car's physical state and its state in the opponent's perspective.
 
-import logging
 import math
 import numpy as np
-import os
-import re
-import rlgym_sim
 
-from abc import ABC, abstractmethod
-from bubo_misc_utils import clamp, distance, distance2D, normalize, relative_velocity_mag, sign # *
-from rlgym_ppo import Learner
-from rlgym_ppo.util import MetricsLogger
-from rlgym_sim.utils import common_values, RewardFunction
-from rlgym_sim.utils import math as rl_math
-from rlgym_sim.utils.action_parsers import DiscreteAction
-from rlgym_sim.utils.common_values import *
-from rlgym_sim.utils.gamestates import GameState, PlayerData
-from rlgym_sim.utils.obs_builders import DefaultObs
-from rlgym_sim.utils.reward_functions import CombinedReward, RewardFunction
-from rlgym_sim.utils.reward_functions.common_rewards import *
-from rlgym_sim.utils.reward_functions.common_rewards.player_ball_rewards import FaceBallReward
-from rlgym_sim.utils.state_setters import RandomState
-from rlgym_sim.utils.terminal_conditions.common_conditions import GoalScoredCondition, NoTouchTimeoutCondition
-
-SIDE_WALL_X = 4096  # +/-
-BACK_WALL_Y = 5120  # +/-
-CEILING_Z = 2044
-BACK_NET_Y = 6000  # +/-
-
-GOAL_HEIGHT = 642.775
-
-ORANGE_GOAL_CENTER = (0, BACK_WALL_Y, GOAL_HEIGHT / 2)
-BLUE_GOAL_CENTER = (0, -BACK_WALL_Y, GOAL_HEIGHT / 2)
-
-# Often more useful than center
-ORANGE_GOAL_BACK = (0, BACK_NET_Y, GOAL_HEIGHT / 2)
-BLUE_GOAL_BACK = (0, -BACK_NET_Y, GOAL_HEIGHT / 2)
-
-# ORANGE_GOAL_WAY_BACK = (0, 8000, GOAL_HEIGHT / 2)
-# BLUE_GOAL_WAY_BACK = (0, -8000, GOAL_HEIGHT / 2)
-# [throttle, steer, pitch, yaw, roll, jump, boost, handbrake]
-BALL_RADIUS = 92.75
-
-BALL_MAX_SPEED = 6000
-CAR_MAX_SPEED = 2300
-SUPERSONIC_THRESHOLD = 2200
-CAR_MAX_ANG_VEL = 5.5
-
-BLUE_TEAM = 0
-ORANGE_TEAM = 1
-NUM_ACTIONS = 8
-
-BOOST_LOCATIONS = (
-    (0.0, -4240.0, 70.0),
-    (-1792.0, -4184.0, 70.0),
-    (1792.0, -4184.0, 70.0),
-    (-3072.0, -4096.0, 73.0),
-    (3072.0, -4096.0, 73.0),
-    (-940.0, -3308.0, 70.0),
-    (940.0, -3308.0, 70.0),
-    (0.0, -2816.0, 70.0),
-    (-3584.0, -2484.0, 70.0),
-    (3584.0, -2484.0, 70.0),
-    (-1788.0, -2300.0, 70.0),
-    (1788.0, -2300.0, 70.0),
-    (-2048.0, -1036.0, 70.0),
-    (0.0, -1024.0, 70.0),
-    (2048.0, -1036.0, 70.0),
-    (-3584.0, 0.0, 73.0),
-    (-1024.0, 0.0, 70.0),
-    (1024.0, 0.0, 70.0),
-    (3584.0, 0.0, 73.0),
-    (-2048.0, 1036.0, 70.0),
-    (0.0, 1024.0, 70.0),
-    (2048.0, 1036.0, 70.0),
-    (-1788.0, 2300.0, 70.0),
-    (1788.0, 2300.0, 70.0),
-    (-3584.0, 2484.0, 70.0),
-    (3584.0, 2484.0, 70.0),
-    (0.0, 2816.0, 70.0),
-    (-940.0, 3310.0, 70.0),
-    (940.0, 3308.0, 70.0),
-    (-3072.0, 4096.0, 73.0),
-    (3072.0, 4096.0, 73.0),
-    (-1792.0, 4184.0, 70.0),
-    (1792.0, 4184.0, 70.0),
-    (0.0, 4240.0, 70.0),
+from abc import abstractmethod
+from bubo_misc_utils import (
+    clamp, distance, distance2D, normalize,
+    relative_velocity_mag, sign
 )
+from rlgym_sim.utils import RewardFunction
+from rlgym_sim.utils import math as rl_math
+from rlgym_sim.utils.common_values import (
+    BLUE_TEAM, ORANGE_TEAM, BALL_MAX_SPEED, BALL_RADIUS,
+    CAR_MAX_SPEED, BLUE_GOAL_BACK, ORANGE_GOAL_BACK,
+    BACK_WALL_Y, BLUE_GOAL_CENTER, ORANGE_GOAL_CENTER,
+    BACK_NET_Y
+)
+from rlgym_sim.utils.gamestates import GameState, PlayerData
+from rlgym_sim.utils.reward_functions import CombinedReward, RewardFunction
 
-#sort
+class Vec3:
+    """
+    A class to represent a 3D vector.
+
+    Attributes:
+        x (float): The x-coordinate of the vector.
+        y (float): The y-coordinate of the vector.
+        z (float): The z-coordinate of the vector.
+
+    Methods:
+        __sub__(self, other): Subtracts another Vec3 from the current Vec3.
+        normalized(self): Returns a new normalized (unit) vector.
+        magnitude(self): Returns the magnitude (length) of the vector.
+        dot(self, other): Returns the dot product of the current Vec3 with another Vec3.
+    """
+    def __init__(self, x=0, y=0, z=0):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def __sub__(self, other):
+        return Vec3(self.x - other.x, self.y - other.y, self.z - other.z)
+
+    def normalized(self):
+        magnitude = self.magnitude()
+        return Vec3(
+            self.x / magnitude,
+            self.y / magnitude,
+            self.z / magnitude
+        ) if magnitude != 0 else Vec3()
+
+    def magnitude(self):
+        return math.sqrt(self.x**2 + self.y**2 + self.z**2)
+
+    def dot(self, other):
+        return self.x * other.x + self.y * other.y + self.z * other.z
+
 class AerialDistanceReward:
-    def __init__(self, reward_fn, min_height_val=150, max_height_val=800, 
+    """
+    A reward function based on the distance the ball travels in the air.
+
+    Attributes:
+        reward_fn (RewardFunction): The reward function to apply.
+        min_height_ratio (float): Minimum ratio for height in the reward calculation.
+        max_height_ratio (float): Maximum ratio for height in the reward calculation.
+        target_height (float): The target height for the ball to reach.
+        max_height (float): The maximum height allowed.
+        min_height (float): The minimum height allowed.
+        total_height (float): Accumulated height of the ball in aerial distance.
+        num_ticks_touched (int): Number of times the ball has been touched.
+        curr_tick (int): The current tick number of the game.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward.
+        get_final_reward(self, player, state, previous_action):
+        Returns the final reward.
+    """
+    def __init__(self, reward_fn, min_height_val=150, max_height_val=800,
                  min_val_ratio=0.1, max_val_ratio=4.0):
         self.reward_fn = reward_fn
         self.min_height_ratio = min_val_ratio
@@ -113,7 +103,11 @@ class AerialDistanceReward:
         self.curr_tick = 0
 
     def reset(self, initial_state):
-        avg_height = self.total_height / self.num_ticks_touched if self.num_ticks_touched > 0 else self.min_height
+        avg_height = (
+            self.total_height / self.num_ticks_touched
+            if self.num_ticks_touched > 0
+            else self.min_height
+        )
         self.target_height = min(max(avg_height, self.min_height), self.max_height)
         self.num_ticks_touched = 0
         self.curr_tick = initial_state['tick_num']
@@ -125,7 +119,10 @@ class AerialDistanceReward:
             self.num_ticks_touched += 1
             self.curr_tick = state['tick_num']
 
-        height_diff = state['ball']['position']['z'] - self.target_height + (self.target_height / 4.0)
+        height_diff = (
+            state['ball']['position']['z'] - self.target_height +
+            (self.target_height / 4.0)
+        )
         height_ratio = height_diff / (self.target_height / 4.0)**1.25
 
         height_ratio = max(self.min_height_ratio, min(self.max_height_ratio, height_ratio))
@@ -133,8 +130,25 @@ class AerialDistanceReward:
 
     def get_final_reward(self, player, state, previous_action):
         return self.get_reward(player, state, previous_action)
-    
+
 class AerialNavigation(RewardFunction):
+    """
+    A reward function based on the aerial navigation of the player in the game.
+
+    Attributes:
+        ball_height_min (float): Minimum height for the ball to be
+        relevant for the reward.
+        player_height_min (float): Minimum height for the player to be
+        relevant for the reward.
+        face_reward (FaceBallReward): A reward function for the player's
+        alignment with the ball.
+        beginner (bool): A flag indicating whether the player is a beginner.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward.
+    """
     def __init__(
         self, ball_height_min=400, player_height_min=200, beginner=True
     ) -> None:
@@ -183,6 +197,23 @@ class AerialNavigation(RewardFunction):
         return max(reward, 0)
 
 class AerialTraining(RewardFunction):
+    """
+    A reward function for training aerial movements with specific player height
+    and ball height criteria.
+
+    Attributes:
+        vel_reward (VelocityPlayerToBallReward): A reward function based on the
+        player's velocity toward the ball.
+        ball_height_min (float): Minimum height for the ball to be considered
+        for the reward.
+        player_min_height (float): Minimum height for the player to be considered
+        for the reward.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward.
+    """
     def __init__(self, ball_height_min=400, player_min_height=300) -> None:
         super().__init__()
         self.vel_reward = VelocityPlayerToBallReward()
@@ -206,6 +237,14 @@ class AerialTraining(RewardFunction):
         return 0
 
 class AirReward(RewardFunction):
+    """
+    A reward function that rewards the player when they are in the air.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward.
+    """
     def __init__(
         self,
     ):
@@ -225,6 +264,24 @@ class AirReward(RewardFunction):
         return 0
 
 class AirTouchReward:
+    """
+    A reward function for rewarding players when they make an aerial touch with the ball.
+
+    Attributes:
+        weight (float): The weight of the reward for an aerial touch.
+        min_height (float): Minimum height for the ball to count as an aerial touch.
+        previous_ball_position (Vec3): Cached position of the ball from the previous tick.
+        previous_ball_velocity (Vec3): Cached velocity of the ball from the previous tick.
+        previous_player_states (list): Cached states of players from the previous tick.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        pre_step(self, state): Caches the ball and player data for the next step.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward for an aerial touch.
+        get_final_reward(self, player, state, previous_action):
+        Returns the final reward for the aerial touch.
+    """
     def __init__(self, weight=2.0, min_height=150):
         """
         :param weight: The weight of the reward.
@@ -232,7 +289,10 @@ class AirTouchReward:
         """
         self.weight = weight
         self.min_height = min_height
-    
+        self.previous_ball_position = None
+        self.previous_ball_velocity = None
+        self.previous_player_states = None
+
     def reset(self, initial_state):
         pass
 
@@ -263,6 +323,19 @@ class AirTouchReward:
         return self.get_reward(player, state, previous_action)
 
 class AlignBallGoal(RewardFunction):
+    """
+    A reward function for aligning the ball with the player's goal,
+    considering offensive and defensive alignments.
+
+    Attributes:
+        defense (float): Weight for the defensive alignment.
+        offense (float): Weight for the offensive alignment.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward based on alignment.
+    """
     def __init__(self, defense=1., offense=1.):
         super().__init__()
         self.defense = defense
@@ -271,7 +344,8 @@ class AlignBallGoal(RewardFunction):
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         ball = state.ball.position
         pos = player.car_data.position
         protecc = np.array(BLUE_GOAL_BACK)
@@ -288,6 +362,17 @@ class AlignBallGoal(RewardFunction):
         return defensive_reward + offensive_reward
 
 class BallYCoordinateReward(RewardFunction):
+    """
+    A reward function based on the Y-coordinate of the ball.
+
+    Attributes:
+        exponent (int): Exponent to adjust the reward calculation.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward based on the ball's Y-coordinate.
+    """
     def __init__(self, exponent=1):
         # Exponent should be odd so that negative y -> negative reward
         self.exponent = exponent
@@ -308,6 +393,14 @@ class BallYCoordinateReward(RewardFunction):
             ) ** self.exponent
 
 class BoostAcquisitions(RewardFunction):
+    """
+    A reward function based on the acquisition of boost by the player.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward for boost acquisition.
+    """
     def __init__(self) -> None:
         super().__init__()
         self.boost_reserves = 1
@@ -323,6 +416,14 @@ class BoostAcquisitions(RewardFunction):
         return 0 if boost_gain <= 0 else boost_gain
 
 class BoostDiscipline(RewardFunction):
+    """
+    A reward function that penalizes players for using boost unnecessarily.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Returns the reward based on boost usage discipline.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -332,18 +433,34 @@ class BoostDiscipline(RewardFunction):
         return float(-previous_action[6])
 
 class BoostPickupReward(RewardFunction):
+    """
+    A reward function for rewarding players when they pick up boost.
+
+    Attributes:
+        previous_boost (dict): Stores the previous boost amount for each player.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward for boost pickup.
+    """
     def __init__(self):
         super().__init__()
         self.previous_boost = {}
 
     def reset(self, initial_state: GameState):
         # Initialize previous_boost as a dictionary with car_id as the key
-        self.previous_boost = {player.car_id: player.boost_amount for player in initial_state.players}
+        self.previous_boost = {
+            player.car_id: player.boost_amount
+            for player in initial_state.players
+        }
 
     def get_reward(self, player: PlayerData, state: GameState, previous_action) -> float:
         # Calculate boost difference
-        boost_diff = player.boost_amount - self.previous_boost.get(player.car_id, player.boost_amount)
-        
+        boost_diff = player.boost_amount - self.previous_boost.get(
+            player.car_id, player.boost_amount
+        )
+
         # Ensure boost_diff is not negative
         if boost_diff < 0:
             boost_diff = 0  # Can also set it to a minimum value if needed, e.g., 0 or another value
@@ -353,16 +470,42 @@ class BoostPickupReward(RewardFunction):
 
         # Return the square root of boost_diff
         return np.sqrt(boost_diff)
-    
+
 class BoostTrainer(RewardFunction):
+    """
+    A reward function for training boost-related actions.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Returns a reward based on boost training actions.
+    """
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         return previous_action[6] == 0
 
 class CenterReward(RewardFunction):
-    def __init__(self, centered_distance=1200, punish_area_exit=False, non_participation_reward=0.0):
+    """
+    A reward function based on the player's proximity to the center of the field.
+
+    Attributes:
+        centered_distance (float): The distance from the center
+        where the player is considered centered.
+        punish_area_exit (bool): Whether to penalize players who leave the centered area.
+        non_participation_reward (float): Reward for non-participation.
+        centered (bool): Whether the player is centered on the field.
+        goal_spot (np.ndarray): The coordinates of the goal spot.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward for being centered on the field.
+    """
+    def __init__(self, centered_distance=1200, punish_area_exit=False,
+                 non_participation_reward=0.0):
         self.centered_distance = centered_distance
         self.punish_area_exit = punish_area_exit
         self.non_participation_reward = non_participation_reward
@@ -399,6 +542,19 @@ class CenterReward(RewardFunction):
         return reward
 
 class ChallengeReward(RewardFunction):
+    """
+    A reward function for rewarding players based on their
+    proximity to the ball during a challenge.
+
+    Attributes:
+        challenge_distance (float): The distance from the
+        ball at which a challenge occurs.
+
+    Methods:
+        reset(self, initial_state): Resets the reward function state.
+        get_reward(self, player, state, previous_action):
+        Calculates and returns the reward for participating in a challenge.
+    """
     def __init__(self, challenge_distance=300):
         super().__init__()
         self.challenge_distance = challenge_distance
@@ -432,7 +588,15 @@ class ChallengeReward(RewardFunction):
         return reward
 
 class ClearReward(RewardFunction):
-    def __init__(self, protected_distance=1200, punish_area_entry=False, non_participation_reward=0.0):
+    """
+    Reward function for clearing the ball from a protected area. 
+    The reward depends on the distance to the goal and whether
+    the player is involved in the clearance. 
+    If the ball is within the protected area, the player is expected to clear it. 
+    Non-participation in the clearance yields a penalty.
+    """
+    def __init__(self, protected_distance=1200, punish_area_entry=False,
+                 non_participation_reward=0.0):
         self.protected_distance = protected_distance
         self.punish_area_entry=punish_area_entry
         self.non_participation_reward = non_participation_reward
@@ -469,6 +633,10 @@ class ClearReward(RewardFunction):
         return reward
 
 class ConditionalRewardFunction(RewardFunction):
+    """
+    A wrapper for applying a specific reward function conditionally based on custom logic. 
+    The reward is only awarded if a condition is met.
+    """
     def __init__(self, reward_func: RewardFunction):
         super().__init__()
         self.reward_func = reward_func
@@ -481,25 +649,35 @@ class ConditionalRewardFunction(RewardFunction):
         print(f"Resetting {self.__class__.__name__}")
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if self.condition(player, state, previous_action):
             return self.reward_func.get_reward(player, state, previous_action)
         return 0
 
-    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if self.condition(player, state, previous_action):
             return self.reward_func.get_final_reward(player, state, previous_action)
         return 0
 
 class ConstantReward(RewardFunction):
+    """
+    A constant reward function that always returns the same fixed reward (1).
+    """
     def reset(self, initial_state: GameState):
         print(f"Resetting {self.__class__.__name__}")
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         return 1
 
 class ControllerModerator(RewardFunction):
+    """
+    Reward function that applies a reward when a specific controller action
+    (e.g., button press) is detected.
+    """
     def __init__(self, index: int = 0, val: int = 0, reward: float = -1):
         super().__init__()
         self.index = index
@@ -517,6 +695,12 @@ class ControllerModerator(RewardFunction):
         return 0
 
 class CradleFlickReward(RewardFunction):
+    """
+    Reward function for promoting stable carries and rewarding flicking
+    or jump-based ball movements.
+    It applies different rewards based on the player's actions and stability
+    in carrying the ball.
+    """
     def __init__(
         self,
         minimum_barrier: float = 400,
@@ -581,6 +765,10 @@ class CradleFlickReward(RewardFunction):
         return reward
 
 class CradleReward(RewardFunction):
+    """
+    Reward function for encouraging stable cradling of the
+    ball within a specific proximity to the player.
+    """
     def __init__(self, minimum_barrier: float = 200):
         super().__init__()
         self.min_distance = minimum_barrier
@@ -614,6 +802,10 @@ class CradleReward(RewardFunction):
         return 0
 
 class DefenderReward(RewardFunction):
+    """
+    Reward function for defensive players.
+    It encourages players to stay near their goal and prevent scoring opportunities.
+    """
     def __init__(self):
         super().__init__()
         self.enemy_goals = 0
@@ -641,6 +833,10 @@ class DefenderReward(RewardFunction):
         return reward
 
 class DefenseTrainer(RewardFunction):
+    """
+    Reward function that incentivizes defending actions,
+    such as positioning the player between the ball and the goal.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -660,6 +856,10 @@ class DefenseTrainer(RewardFunction):
         return -clamp(1, 0, float(norm_pos_diff.dot(vel)*scale))
 
 class DemoPunish(RewardFunction):
+    """
+    Reward function that penalizes players for being demoed.
+    A penalty is given when a player is demoed.
+    """
     def __init__(self) -> None:
         super().__init__()
         self.demo_statuses = [True for _ in range(64)]
@@ -667,7 +867,8 @@ class DemoPunish(RewardFunction):
     def reset(self, initial_state: GameState) -> None:
         self.demo_statuses = [True for _ in range(64)]
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         reward = 0
         if player.is_demoed and not self.demo_statuses[player.car_id]:
             reward = -1
@@ -676,6 +877,10 @@ class DemoPunish(RewardFunction):
         return reward
 
 class DistanceReward(RewardFunction):
+    """
+    Reward function that provides rewards based on the player's proximity to the ball.
+    The reward decreases as the distance to the ball increases.
+    """
     def __init__(self, dist_max=1000, max_reward=2):
         super().__init__()
         self.dist_max = dist_max
@@ -702,16 +907,24 @@ class DistanceReward(RewardFunction):
         return 1 - (distance / self.dist_max)
 
 class EventReward(RewardFunction):
-    def __init__(self, goal=0., team_goal=0., concede=-0., touch=0., shot=0., save=0., demo=0., boost_pickup=0.):
+    """
+    Reward function that provides rewards for various
+    in-game events such as goals, shots, saves, demos, and boost pickups.
+    """
+    def __init__(self, goal=0., team_goal=0., concede=-0., touch=0.,
+                 shot=0., save=0., demo=0., boost_pickup=0.):
         """
         :param goal: reward for goal scored by player.
         :param team_goal: reward for goal scored by player's team.
-        :param concede: reward for goal scored by opponents. Should be negative if used as punishment.
+        :param concede: reward for goal scored by opponents.
+        # Should be negative if used as punishment.
         :param touch: reward for touching the ball.
         :param shot: reward for shooting the ball (as detected by Rocket League).
         :param save: reward for saving the ball (as detected by Rocket League).
         :param demo: reward for demolishing a player.
-        :param boost_pickup: reward for picking up boost. big pad = +1.0 boost, small pad = +0.12 boost.
+        :param boost_pickup: reward for picking up boost. 
+        # Big pad = +1.0 boost, 
+        # small pad = +0.12 boost.
         """
         super().__init__()
         self.weights = np.array([goal, team_goal, concede, touch, shot, save, demo, boost_pickup])
@@ -724,8 +937,15 @@ class EventReward(RewardFunction):
         else:
             team, opponent = state.orange_score, state.blue_score
 
-        return np.array([player.match_goals, team, opponent, player.ball_touched, player.match_shots,
-                         player.match_saves, player.match_demolishes, player.boost_amount])
+        return np.array([
+            player.match_goals,
+            team, opponent,
+            player.ball_touched,
+            player.match_shots,
+            player.match_saves,
+            player.match_demolishes,
+            player.boost_amount
+        ])
 
     def reset(self, initial_state: GameState, optional_data=None):
         # Update every reset since rocket league may crash and be restarted with clean values
@@ -733,7 +953,13 @@ class EventReward(RewardFunction):
         for player in initial_state.players:
             self.last_registered_values[player.car_id] = self._extract_values(player, initial_state)
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray, optional_data=None):
+    def get_reward(
+        self,
+        player: PlayerData,
+        state: GameState,
+        previous_action: np.ndarray,
+        optional_data=None
+    ):
         old_values = self.last_registered_values[player.car_id]
         new_values = self._extract_values(player, state)
 
@@ -746,16 +972,25 @@ class EventReward(RewardFunction):
         return reward
 
 class FaceBallReward(RewardFunction):
+    """
+    Reward function that encourages the player to face the ball,
+    with rewards based on the alignment between the player's car and the ball.
+    """
     def reset(self, initial_state: GameState):
         print(f"Resetting {self.__class__.__name__}")
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         pos_diff = state.ball.position - player.car_data.position
         norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
         return float(np.dot(player.car_data.forward(), norm_pos_diff))
 
 class FlatSpeedReward(RewardFunction):
+    """
+    Reward function that provides a reward based on the player's flat speed,
+    normalized to a maximum speed of 2300.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -765,6 +1000,10 @@ class FlatSpeedReward(RewardFunction):
         return abs(np.linalg.norm(player.car_data.linear_velocity[:2])) / 2300
 
 class FlipCorrecter(RewardFunction):
+    """
+    Reward function that encourages correct flip mechanics,
+    rewarding players for proper flip timing and direction.
+    """
     def __init__(self) -> None:
         self.last_velocity = np.zeros(3)
         self.armed = False
@@ -799,6 +1038,10 @@ class FlipCorrecter(RewardFunction):
         return reward
 
 class ForwardBiasReward(RewardFunction):
+    """
+    Reward function that biases the player's forward movement by
+    rewarding the player for moving forward.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -808,6 +1051,10 @@ class ForwardBiasReward(RewardFunction):
         return player.car_data.forward().dot(normalize(player.car_data.linear_velocity))
 
 class GoalboxPenalty(RewardFunction):
+    """
+    Penalizes players who enter the goalbox,
+    discouraging undesirable positions near the goal area.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -819,6 +1066,10 @@ class GoalboxPenalty(RewardFunction):
         return 0
 
 class GoalSpeedAndPlacementReward(RewardFunction):
+    """
+    Rewards players based on scoring, ball velocity, and height,
+    with different reward scales for each condition.
+    """
     def __init__(self):
         self.prev_score_blue = 0
         self.prev_score_orange = 0
@@ -832,8 +1083,9 @@ class GoalSpeedAndPlacementReward(RewardFunction):
         self.prev_score_orange = initial_state.orange_score
         self.prev_state_blue = initial_state
         self.prev_state_orange = initial_state
-    
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if player.team_num == BLUE_TEAM:
             score = state.blue_score
             # check to see if goal scored
@@ -844,24 +1096,26 @@ class GoalSpeedAndPlacementReward(RewardFunction):
                 self.prev_state_blue = state
                 self.prev_score_blue = score
                 return reward
-            else:
-                self.prev_state_blue = state
-                return 0.0
-        else:
-            score = state.orange_score
-            # check to see if goal scored
-            if score > self.prev_score_orange:
-                reward = np.linalg.norm(self.prev_state_orange.ball.linear_velocity) / BALL_MAX_SPEED
-                if self.prev_state_orange.ball.position[2] > self.min_height:
-                    reward = self.height_reward * reward
-                self.prev_state_orange = state
-                self.prev_score_orange = score
-                return reward
-            else:
-                self.prev_state_orange = state
-                return 0.0
-    
+            self.prev_state_blue = state
+            return 0.0
+
+        score = state.orange_score
+        # check to see if goal scored
+        if score > self.prev_score_orange:
+            reward = np.linalg.norm(self.prev_state_orange.ball.linear_velocity) / BALL_MAX_SPEED
+            if self.prev_state_orange.ball.position[2] > self.min_height:
+                reward = self.height_reward * reward
+            self.prev_state_orange = state
+            self.prev_score_orange = score
+            return reward
+        self.prev_state_orange = state
+        return 0.0
+
 class GoodVelocityPlayerToBallReward:
+    """
+    Encourages players to approach the ball with
+    Appropriate speed and alignment, rewarding good positioning.
+    """
     def __init__(self, weight=1.0, max_speed=2300):
         self.weight = weight
         self.max_speed = max_speed
@@ -883,6 +1137,10 @@ class GoodVelocityPlayerToBallReward:
         return self.weight * scaled_reward
 
 class GroundDribbleReward:
+    """
+    Rewards players for maintaining control of the ball while
+    dribbling on the ground within a specified distance.
+    """
     def __init__(self, weight=1.0, max_distance=300):
         """
         :param weight: The weight of the reward.
@@ -911,6 +1169,10 @@ class GroundDribbleReward:
         return 0
 
 class GroundedReward(RewardFunction):
+    """
+    Rewards players for being grounded, providing a reward when
+    the player is not in the air.
+    """
     def __init__(
         self,
     ):
@@ -925,6 +1187,10 @@ class GroundedReward(RewardFunction):
         return player.on_ground is True
 
 class HeightTouchReward(RewardFunction):
+    """
+    Rewards players for touching the ball at a height greater than a
+    specified minimum, with additional rewards for ground behavior and cooperation.
+    """
     def __init__(self, min_height=92, exp=0.2, coop_dist=0):
         super().__init__()
         self.min_height = min_height
@@ -939,9 +1205,7 @@ class HeightTouchReward(RewardFunction):
             if p.car_id != player.car_id and \
                     distance(player.car_data.position, p.car_data.position) < self.cooperation_dist:
                 return True
-
         return False
-
 
     def get_reward(
         self, player: PlayerData, state: GameState, previous_action: np.ndarray
@@ -949,18 +1213,25 @@ class HeightTouchReward(RewardFunction):
         reward = 0
         if player.ball_touched:
             if state.ball.position[2] >= self.min_height:
-                if not player.on_ground or self.cooperation_dist < 90 or not self.cooperation_detector(player, state):
+                if (
+                    not player.on_ground
+                    or self.cooperation_dist < 90
+                    or not self.cooperation_detector(player, state)
+                ):
                     if player.on_ground:
-                        reward += clamp(5000, 0.0001, (state.ball.position[2]-92)) ** self.exp
+                        reward += clamp(5000, 0.0001, (state.ball.position[2] - 92)) ** self.exp
                     else:
-                        reward += clamp(500, 1, (state.ball.position[2] ** (self.exp*2)))
-
+                        reward += clamp(500, 1, (state.ball.position[2] ** (self.exp * 2)))
             elif not player.on_ground:
                 reward += 1
 
         return reward
 
 class InAirReward(RewardFunction):
+    """
+    Rewards players for being in the air, providing a reward when the player
+    is not on the ground.
+    """
     def __init__(self):
         super().__init__()
 
@@ -971,9 +1242,13 @@ class InAirReward(RewardFunction):
         return 1 if not player.on_ground else 0
 
 class JumpTouchReward(RewardFunction):
+    """
+    Rewards players for touching the ball while airborne and at a
+    specific height range, with scaled rewards based on the height.
+    """
     def __init__(self, min_height=92.75):
         self.min_height = min_height
-        self.max_height = 2044-92.75
+        self.max_height = 2044 - 92.75
         self.range = self.max_height - self.min_height
 
     def reset(self, initial_state: GameState):
@@ -982,19 +1257,28 @@ class JumpTouchReward(RewardFunction):
     def get_reward(
         self, player: PlayerData, state: GameState, previous_action: np.ndarray
     ) -> float:
-        if player.ball_touched and not player.on_ground and state.ball.position[2] >= self.min_height:
+        if (
+            player.ball_touched
+            and not player.on_ground
+            and state.ball.position[2] >= self.min_height
+        ):
             return (state.ball.position[2] - self.min_height) / self.range
 
         return 0
 
 class KickoffProximityReward(RewardFunction):
+    """
+    Rewards players for being the closest to the ball during a kickoff,
+    penalizing players who are further from the ball.
+    """
     def __init__(self):
         super().__init__()
 
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if state.ball.position[0] == 0 and state.ball.position[1] == 0:
             player_pos = np.array(player.car_data.position)
             ball_pos = np.array(state.ball.position)
@@ -1009,11 +1293,14 @@ class KickoffProximityReward(RewardFunction):
 
             if opponent_distances and player_dist_to_ball < min(opponent_distances):
                 return 1
-            else:
-                return -1
+            return -1
         return 0
 
 class KickoffReward(RewardFunction):
+    """
+    Rewards players based on their positioning during kickoffs,
+    penalizing poor positioning or improper use of boost.
+    """
     def __init__(self, boost_punish: bool = True):
         super().__init__()
         self.vel_dir_reward = VelocityPlayerToBallReward()
@@ -1034,17 +1321,19 @@ class KickoffReward(RewardFunction):
                 dist = distance(p.car_data.position, state.ball.position)
                 if dist < player_dist:
                     return False
-
         return True
-
 
     def get_reward(
         self, player: PlayerData, state: GameState, previous_action: np.ndarray
     ) -> float:
         reward = 0
-        if state.ball.position[0] == 0 and state.ball.position[1] == 0 and self.closest_to_ball(player, state):
+        ball_position = state.ball.position
+        if (
+            ball_position[0] == 0
+            and ball_position[1] == 0
+            and self.closest_to_ball(player, state)
+        ):
             if self.ticks > 0 and self.boost_punish:
-
                 if (
                     previous_action[6] < 1
                     and np.linalg.norm(player.car_data.linear_velocity) < 2200
@@ -1063,6 +1352,10 @@ class KickoffReward(RewardFunction):
         return reward
 
 class LandingRecoveryReward(RewardFunction):
+    """
+    Rewards players for recovering from a mid-air position and landing in
+    alignment with their forward movement direction.
+    """
     def __init__(self) -> None:
         super().__init__()
         self.up = np.array([0, 0, 1])
@@ -1097,24 +1390,32 @@ class LandingRecoveryReward(RewardFunction):
         return reward
 
 class LavaFloorReward(RewardFunction):
-    @staticmethod
-    def get_reward(player: PlayerData, state: GameState, previous_action: np.ndarray, optional_data=None):
+    """
+    Penalizes players who are on the ground below a certain height,
+    discouraging movement near the "lava" area.
+    """
+    def reset(self, initial_state: GameState):
+        pass
+
+    # @staticmethod
+    def get_reward(player: PlayerData, state: GameState, previous_action: np.ndarray):
         if player.on_ground and player.car_data.position[2] < 50:
             return -1
         return 0
 
-    @staticmethod
-    def reset(initial_state: GameState):
-        pass
-
 class LemTouchBallReward(RewardFunction):
-    def init(self, aerial_weight=0):
-        self.aerial_weight = aerial_weight
+    """
+    Rewards players for touching the ball at higher altitudes,
+    with more reward for higher jumps.
+    """
+    def init(self):
+        self.aerial_weight = 0
 
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if player.ball_touched:
             if not player.on_ground and player.car_data.position[2] >= 256:
                 height_reward = np.log1p(player.car_data.position[2] - 256)
@@ -1122,6 +1423,10 @@ class LemTouchBallReward(RewardFunction):
         return 0
 
 class LiuDistanceBallToGoalReward(RewardFunction):
+    """
+    Rewards players based on their distance to the goal,
+    with a higher reward for positioning the ball closer to the opponent's goal.
+    """
     def __init__(self, own_goal=False):
         super().__init__()
         self.own_goal = own_goal
@@ -1129,7 +1434,9 @@ class LiuDistanceBallToGoalReward(RewardFunction):
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(
+        self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if player.team_num == BLUE_TEAM and not self.own_goal \
                 or player.team_num == ORANGE_TEAM and self.own_goal:
             objective = np.array(ORANGE_GOAL_BACK)
@@ -1137,21 +1444,32 @@ class LiuDistanceBallToGoalReward(RewardFunction):
             objective = np.array(BLUE_GOAL_BACK)
 
         # Compensate for moving objective to back of net
-        dist = np.linalg.norm(state.ball.position - objective) - (BACK_NET_Y - BACK_WALL_Y + BALL_RADIUS)
-        return np.exp(-0.5 * dist / BALL_MAX_SPEED)  # Inspired by https://arxiv.org/abs/2105.12196
+        dist = np.linalg.norm(state.ball.position - objective) - \
+               (BACK_NET_Y - BACK_WALL_Y + BALL_RADIUS)
+        return np.exp(-0.5 * dist / BALL_MAX_SPEED)
+    # Inspired by https://arxiv.org/abs/2105.12196
 
 class LiuDistancePlayerToBallReward(RewardFunction):
+    """
+    Rewards players based on their proximity to the ball,
+    with a higher reward for being closer to the ball.
+    """
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         # Compensate for inside of ball being unreachable (keep max reward at 1)
         dist = np.linalg.norm(player.car_data.position - state.ball.position) - BALL_RADIUS
         return np.exp(-0.5 * dist / CAR_MAX_SPEED)  # Inspired by https://arxiv.org/abs/2105.12196
 
 class MillennialKickoffReward(RewardFunction):
+    """
+    Rewards players for being the closest to the ball during kickoffs,
+    penalizing players who are further away.
+    """
     def __init__(self):
-        super().__init__()
+        pass  # super().__init__()
 
     def reset(self, initial_state: GameState):
         pass
@@ -1163,26 +1481,36 @@ class MillennialKickoffReward(RewardFunction):
                 dist = np.linalg.norm(p.car_data.position - state.ball.position)
                 if dist < player_dist:
                     return False
-
         return True
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
-        if state.ball.position[0] == 0 and state.ball.position[1] == 0 and self.closest_to_ball(player, state):
+    def get_reward(
+        self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
+        if (
+            state.ball.position[0] == 0
+            and state.ball.position[1] == 0
+            and self.closest_to_ball(player, state)
+        ):
             return -1
         return 0
 
 class ModifiedTouchReward(RewardFunction):
-    def __init__(self, min_change: float = 300, min_height: float = 200, vel_scale: float = 1, touch_scale: float = 1, jump_reward: bool = False, jump_scale: float = 0.1, tick_min: int = 0):
+    """
+    A reward function that modifies rewards based on power shot rewards, height,
+    and player jump behavior.
+    It also includes a timer mechanism to ensure rewards are distributed over time.
+    """
+    def __init__(self):
         super().__init__()
-        self.psr = PowerShotReward(min_change)
-        self.min_height = min_height
-        self.height_cap = 2044-92.75
-        self.vel_scale = vel_scale
-        self.touch_scale = touch_scale
-        self.jump_reward = jump_reward
-        self.jump_scale = jump_scale
+        self.psr = PowerShotReward(min_change=300)
+        self.min_height = 200
+        self.height_cap = 2044 - 92.75
+        self.vel_scale = 1
+        self.touch_scale = 1
+        self.jump_reward = False
+        self.jump_scale = 0.1
         self.tick_count = 0
-        self.tick_min = tick_min
+        self.tick_min = 0
 
     def reset(self, initial_state: GameState):
         self.psr.reset(initial_state)
@@ -1213,6 +1541,10 @@ class ModifiedTouchReward(RewardFunction):
         return reward
 
 class NaiveSpeedReward(RewardFunction):
+    """
+    A simple reward function that provides rewards based on the player's speed,
+    normalized by a constant.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1222,6 +1554,10 @@ class NaiveSpeedReward(RewardFunction):
         return abs(np.linalg.norm(player.car_data.linear_velocity)) / 2300
 
 class OmniBoostDiscipline(RewardFunction):
+    """
+    Penalizes players for excessive boost usage, with an optional
+    aerial forgiveness feature.
+    """
     def __init__(self, aerial_forgiveness=False):
         super().__init__()
         self.values = [0 for _ in range(64)]
@@ -1230,13 +1566,17 @@ class OmniBoostDiscipline(RewardFunction):
     def reset(self, initial_state: GameState):
         self.values = [0 for _ in range(64)]
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         old, self.values[player.car_id] = self.values[player.car_id], player.boost_amount
         if player.on_ground or not self.af:
             return -int(self.values[player.car_id] < old)
         return 0
 
 class OncePerStepRewardWrapper(RewardFunction):
+    """
+    A wrapper to ensure the wrapped reward function only provides a reward once per step.
+    """
     def __init__(self, reward):
         super().__init__()
         self.reward = reward
@@ -1248,7 +1588,8 @@ class OncePerStepRewardWrapper(RewardFunction):
         self.gs = None
         self.rv = 0
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if state == self.gs:
             return self.rv
 
@@ -1258,6 +1599,10 @@ class OncePerStepRewardWrapper(RewardFunction):
         return self.rv
 
 class PlayerAlignment(RewardFunction):
+    """
+    Rewards players for maintaining proper alignment with the ball
+    and their respective goal direction.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1281,6 +1626,10 @@ class PlayerAlignment(RewardFunction):
         return reward
 
 class PositioningReward(RewardFunction):
+    """
+    Rewards players for positioning themselves closer to the ball,
+    penalizing those who are too far.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1300,6 +1649,9 @@ class PositioningReward(RewardFunction):
         return reward
 
 class PositionReward(RewardFunction):
+    """
+    Rewards players for positioning themselves near an optimal point on the field.
+    """
     def __init__(self, weight=1.0):
         super().__init__()
         self.weight = weight
@@ -1307,12 +1659,17 @@ class PositionReward(RewardFunction):
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         optimal_position = np.array([0, 0])
         distance_to_optimal = np.linalg.norm(player.car_data.position[:2] - optimal_position)
         return max(0, self.weight - distance_to_optimal / 1000)
-     
+
 class PositiveBallVelToGoalReward(RewardFunction):
+    """
+    Rewards players based on the velocity of the ball toward the goal,
+    encouraging goal-scoring positions.
+    """
     def __init__(self):
         super().__init__()
         self.rew = VelocityBallToGoalReward()
@@ -1326,6 +1683,10 @@ class PositiveBallVelToGoalReward(RewardFunction):
         return clamp(1, 0, self.rew.get_reward(player, state, previous_action))
 
 class PositivePlayerVelToBallReward(RewardFunction):
+    """
+    Rewards players based on their velocity toward the ball,
+    promoting quicker ball possession.
+    """
     def __init__(self):
         super().__init__()
         self.rew = VelocityPlayerToBallReward()
@@ -1339,7 +1700,9 @@ class PositivePlayerVelToBallReward(RewardFunction):
         return clamp(1, 0, self.rew.get_reward(player, state, previous_action))
 
 class PositiveWrapperReward(RewardFunction):
-    """A simple wrapper to ensure a reward only returns positive values"""
+    """
+    A wrapper that ensures the wrapped reward function always returns a positive value.
+    """
     def __init__(self, base_reward):
         super().__init__()
         #pass in instantiated reward object
@@ -1355,6 +1718,10 @@ class PositiveWrapperReward(RewardFunction):
         return 0 if rew < 0 else rew
 
 class PowerShotReward(RewardFunction):
+    """
+    Rewards players for powerful shots that significantly change the ball's
+    velocity, based on a minimum threshold.
+    """
     def __init__(self, min_change: float = 300):
         super().__init__()
         self.min_change = min_change
@@ -1379,6 +1746,10 @@ class PowerShotReward(RewardFunction):
         return reward
 
 class ProximityToBallReward(RewardFunction):
+    """
+    Rewards players for being closer to the ball, with a maximum distance and
+    a scaling reward.
+    """
     def __init__(self, max_distance=700.0, weight=10.0):
         super().__init__()
         self.max_distance = max_distance
@@ -1397,10 +1768,13 @@ class ProximityToBallReward(RewardFunction):
             normalized_distance = distance_to_ball / self.max_distance
             reward = (1 - normalized_distance) * self.weight
             return reward
-        else:
-            return 0
+        return 0
 
 class PushReward(RewardFunction):
+    """
+    Rewards players for pushing the ball in the right direction,
+    based on its position relative to the field.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1419,7 +1793,7 @@ class PushReward(RewardFunction):
                 return scale
             return y_scale
 
-        elif pos[1] < 0:
+        if pos[1] < 0:
             y_scale = pos[1] / 5213
             if abs(pos[0]) > 800:
                 x_scale = (abs(pos[0]) / 4096) * abs(y_scale)
@@ -1430,27 +1804,39 @@ class PushReward(RewardFunction):
         return 0
 
 class QuickestTouchReward(RewardFunction):
+    """
+    Rewards players for making the quickest touch on the ball after a timeout period,
+    with a final reward based on the time taken.
+    """
     def __init__(self, timeout=0, tick_skip=8):
         self.timeout = timeout * 120 # convert to ticks
         self.tick_skip = tick_skip
+        self.timer = 0
 
     def reset(self, initial_state: GameState):
         self.timer = 0
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         self.timer += self.tick_skip
-                
         return 0
 
-    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if player.ball_touched:
-            reward = max(((self.timeout - self.timer) / self.timeout) * 100, 30) 
+            reward = max(((self.timeout - self.timer) / self.timeout) * 100, 30)
         else:
             reward = -100
         print("QuickestTouchReward.FinalReward(): ", reward)
         return reward
 
-class RegularTouchVelChange(RewardFunction): #this is regular touchvel change without my threshold added
+class RegularTouchVelChange(RewardFunction):
+    """
+    A reward function that calculates the difference in the ball's
+    velocity before and after a player touches the ball.
+    The reward is based on the magnitude of this change,
+    normalized by a constant.
+    """
     def __init__(self):
         self.last_vel = np.zeros(3)
 
@@ -1470,6 +1856,12 @@ class RegularTouchVelChange(RewardFunction): #this is regular touchvel change wi
         return reward
 
 class RetreatReward(RewardFunction):
+    """
+    A reward function for players on defense, encouraging them to move toward a
+    defensive target position when the ball is behind them.
+    The reward depends on the player's speed and position
+    relative to the defensive target.
+    """
     def __init__(self):
         super().__init__()
         self.defense_target = np.array(BLUE_GOAL_BACK)
@@ -1498,11 +1890,26 @@ class RetreatReward(RewardFunction):
         return reward
 
 class RewardIfBehindBall(ConditionalRewardFunction):
+    """
+    A conditional reward function that rewards players for positioning themselves
+    behind the ball, based on their team.
+    """
     def condition(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> bool:
-        return player.team_num == BLUE_TEAM and player.car_data.position[1] < state.ball.position[1] \
-               or player.team_num == ORANGE_TEAM and player.car_data.position[1] > state.ball.position[1]
+        is_blue_team_behind = (
+            player.team_num == BLUE_TEAM
+            and player.car_data.position[1] < state.ball.position[1]
+        )
+        is_orange_team_behind = (
+            player.team_num == ORANGE_TEAM
+            and player.car_data.position[1] > state.ball.position[1]
+        )
+        return is_blue_team_behind or is_orange_team_behind
 
 class RewardIfClosestToBall(ConditionalRewardFunction):
+    """
+    A conditional reward function that rewards a player if they are the closest player
+    to the ball, with an option to reward only team members.
+    """
     def __init__(self, reward_func: RewardFunction, team_only=True):
         super().__init__(reward_func)
         self.team_only = team_only
@@ -1517,10 +1924,18 @@ class RewardIfClosestToBall(ConditionalRewardFunction):
         return True
 
 class RewardIfTouchedLast(ConditionalRewardFunction):
+    """
+    A conditional reward function that rewards a player if they were the last to touch
+    the ball.
+    """
     def condition(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> bool:
         return state.last_touch == player.car_id
 
 class RuleOnePunishment(RewardFunction):
+    """
+    A penalty for players who are on the ground and moving too slowly, especially when
+    in close proximity to another player with similar velocity.
+    """
     def reset(self, initial_state: GameState) -> None:
         pass
 
@@ -1543,6 +1958,10 @@ class RuleOnePunishment(RewardFunction):
         return 0
 
 class SaveBoostReward(RewardFunction):
+    """
+    A reward function that rewards players based on their boost amount,
+    scaled by a constant.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1552,6 +1971,10 @@ class SaveBoostReward(RewardFunction):
         return player.boost_amount * 0.01
 
 class SelectiveChaseReward(RewardFunction):
+    """
+    A reward function that applies a velocity-based reward for players if they are not
+    within a specified distance from the ball.
+    """
     def __init__(self, distance_req: float = 500):
         super().__init__()
         self.vel_dir_reward = VelocityPlayerToBallReward()
@@ -1571,6 +1994,10 @@ class SelectiveChaseReward(RewardFunction):
         return 0
 
 class SequentialRewards(RewardFunction):
+    """
+    A reward function that sequentially applies a list of reward functions over time,
+    switching based on step counts.
+    """
     def __init__(self, rewards: list, steps: list):
         super().__init__()
         self.rewards_list = rewards
@@ -1599,6 +2026,10 @@ class SequentialRewards(RewardFunction):
         )
 
 class SpeedReward(RewardFunction):
+    """
+    A reward function that calculates the player's speed, adjusting based on the direction
+    of their movement relative to their car's forward direction.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1615,13 +2046,18 @@ class SpeedReward(RewardFunction):
         return min(car_speed, 1)
 
 class SpeedTowardBallReward(RewardFunction):
+    """
+    A reward function that rewards players for moving toward the ball,
+    based on their speed and distance to the ball.
+    """
     def __init__(self):
-        super().__init__()
+        pass # super().__init__()
 
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         player_vel = player.car_data.linear_velocity
         pos_diff = (state.ball.position - player.car_data.position)
         dist_to_ball = np.linalg.norm(pos_diff)
@@ -1634,33 +2070,48 @@ class SpeedTowardBallReward(RewardFunction):
 
         if speed_toward_ball > 0:
             return speed_toward_ball / CAR_MAX_SPEED
-        else:
-            return 0
+        return 0
 
 class StarterReward(RewardFunction):
+    """
+    A composite reward function for the starting game phase,
+    incorporating various reward functions such as for goals, touch velocity,
+    and kickoff actions.
+    """
     def __init__(self):
         super().__init__()
         self.goal_reward = 10
         self.boost_weight = 0.1
         self.rew = CombinedReward(
             (
-                EventReward(team_goal=self.goal_reward, concede=-self.goal_reward, demo=self.goal_reward/3),
+                EventReward(
+                    team_goal=self.goal_reward,
+                    concede=-self.goal_reward,
+                    demo=self.goal_reward / 3
+                ),
                 TouchVelChange(),
                 VelocityBallToGoalReward(),
                 VelocityPlayerToBallReward(),
                 JumpTouchReward(min_height=120),
                 KickoffReward(boost_punish=False)
             ),
-            (1.0, 1.5, 0.075, 0.075, 2.0, 0.1))
-            #(1.0, 1.0, 0.1, 2.0, 0.3334, 0.05))
+            (
+                1.0, 1.5, 0.075, 0.075, 2.0, 0.1
+            )
+        )
 
     def reset(self, initial_state: GameState):
         self.rew.reset(initial_state)
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         return self.rew.get_reward(player, state, previous_action)
 
 class SwiftGroundDribbleReward:
+    """
+    A reward function that encourages fast ground dribbling,
+    rewarding players based on their speed and proximity to the ball while grounded.
+    """
     def __init__(self, weight=1.5, min_dribble_speed=500, max_dribble_speed=2300):
         self.weight = weight
         self.min_dribble_speed = min_dribble_speed
@@ -1674,13 +2125,17 @@ class SwiftGroundDribbleReward:
         player_to_ball_distance = (player.position - ball.position).magnitude()
         player_speed = player.velocity.magnitude()
 
-        speed_factor = max(0, min((player_speed - self.min_dribble_speed) / 
+        speed_factor = max(0, min((player_speed - self.min_dribble_speed) /
                                   (self.max_dribble_speed - self.min_dribble_speed), 1.0))
         proximity_factor = max(0, 1 - player_to_ball_distance / 300)
 
         return self.weight * is_grounded * speed_factor * proximity_factor
 
 class TeamSpacingReward(RewardFunction):
+    """
+    A reward function that penalizes players for being too close to their teammates,
+    encouraging better team spacing.
+    """
     def __init__(self, min_spacing: float = 1000) -> None:
         super().__init__()
         self.min_spacing = clamp(math.inf, 0.0000001, min_spacing)
@@ -1691,11 +2146,22 @@ class TeamSpacingReward(RewardFunction):
     def spacing_reward(self, player: PlayerData, state: GameState) -> float:
         reward = 0
         for p in state.players:
-            if p.team_num == player.team_num and p.car_id != player.car_id and not player.is_demoed and not p.is_demoed:
-                separation = distance(player.car_data.position, p.car_data.position)
-                if separation < self.min_spacing:
-                    reward -= 1-(separation / self.min_spacing)
-
+            if (
+                hasattr(p, 'team_num')
+                and hasattr(p, 'car_id')
+                and hasattr(p, 'is_demoed')
+                and hasattr(p, 'car_data')
+            ):
+                if (
+                    p.team_num == player.team_num
+                    and p.car_id != player.car_id
+                    and not player.is_demoed
+                    and not p.is_demoed
+                ):
+                    separation = distance(player.car_data.position, p.car_data.position)
+                    if separation < self.min_spacing:
+                        separation_factor = separation / self.min_spacing
+                        reward -= 1 - separation_factor
         return reward
 
     def get_reward(
@@ -1704,6 +2170,11 @@ class TeamSpacingReward(RewardFunction):
         return self.spacing_reward(player, state)
 
 class ThreeManRewards(RewardFunction):
+    """
+    A reward function that rewards players for maintaining good
+    spacing with their teammates and applies additional rewards for specific roles
+    during gameplay.
+    """
     def __init__(self, min_spacing: float = 1500):
         super().__init__()
         self.min_spacing = min_spacing
@@ -1748,19 +2219,29 @@ class ThreeManRewards(RewardFunction):
         return reward
 
 class TouchBallReward(RewardFunction):
+    """
+    A reward function that rewards players for touching the ball,
+    with adjustments based on the ball's height (aerial rewards).
+    """
     def __init__(self, aerial_weight=0.):
         self.aerial_weight = aerial_weight
 
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if player.ball_touched:
             # Default just rewards 1, set aerial weight to reward more depending on ball height
-            return ((state.ball.position[2] + BALL_RADIUS) / (2 * BALL_RADIUS)) ** self.aerial_weight
+            height_factor = (state.ball.position[2] + BALL_RADIUS) / (2 * BALL_RADIUS)
+            return height_factor ** self.aerial_weight
         return 0
 
 class TouchBallTweakedReward(RewardFunction):
+    """
+    A modified reward function that rewards players for touching the ball,
+    considering factors like height, proximity to enemies, and velocity change.
+    """
     def __init__(
         self,
         min_touch: float = 0.05,
@@ -1787,8 +2268,7 @@ class TouchBallTweakedReward(RewardFunction):
         for car in state.players:
             if car.team_num != player.team_num:
                 dist = distance2D(state.ball.position, car.car_data.position)
-                if dist < closest_dist:
-                    closest_dist = dist
+                closest_dist = min(closest_dist, dist)
         return closest_dist
 
     def get_reward(
@@ -1828,6 +2308,11 @@ class TouchBallTweakedReward(RewardFunction):
         return reward
 
 class TouchVelChange(RewardFunction):
+    """
+    A reward function that calculates the change in the ball's
+    velocity before and after a player touches the ball.
+    The reward is based on the magnitude of this change, normalized by a constant.
+    """
     def __init__(self):
         self.last_vel = np.zeros(3)
 
@@ -1847,6 +2332,10 @@ class TouchVelChange(RewardFunction):
         return reward
 
 class TweakedVelocityPlayerToGoalReward(RewardFunction):
+    """
+    A reward function that rewards a player based on their velocity towards the opponent's goal,
+    considering a leeway range and adjusting for the player's position and team.
+    """
     def __init__(self, max_leeway=100, default_power=0.0) -> None:
         super().__init__()
         self.max_leeway = max_leeway
@@ -1877,6 +2366,11 @@ class TweakedVelocityPlayerToGoalReward(RewardFunction):
         return float(np.dot(norm_pos_diff, vel))
 
 class VelocityBallDefense(RewardFunction):
+    """
+    A reward function that rewards a player for maintaining a
+    defensive position relative to the ball,
+    based on the player's proximity to the opposing goal and the ball's velocity.
+    """
     def reset(self, initial_state: GameState):
         pass
 
@@ -1895,6 +2389,10 @@ class VelocityBallDefense(RewardFunction):
         return float(norm_pos_diff.dot(vel))
 
 class VelocityBallToGoalReward(RewardFunction):
+    """
+    A reward function that calculates the velocity of the ball towards the opponent's goal,
+    with optional adjustments for scalar projection or specific goal orientation.
+    """
     def __init__(self, own_goal=False, use_scalar_projection=False):
         super().__init__()
         self.own_goal = own_goal
@@ -1903,7 +2401,8 @@ class VelocityBallToGoalReward(RewardFunction):
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         if player.team_num == BLUE_TEAM and not self.own_goal \
                 or player.team_num == ORANGE_TEAM and self.own_goal:
             objective = np.array(ORANGE_GOAL_BACK)
@@ -1918,13 +2417,17 @@ class VelocityBallToGoalReward(RewardFunction):
             # Used to guide the agent towards the ball
             inv_t = math.scalar_projection(vel, pos_diff)
             return inv_t
-        else:
-            # Regular component velocity
-            norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
-            norm_vel = vel / BALL_MAX_SPEED
-            return float(np.dot(norm_pos_diff, norm_vel))
+
+        # Regular component velocity
+        norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
+        norm_vel = vel / BALL_MAX_SPEED
+        return float(np.dot(norm_pos_diff, norm_vel))
 
 class VelocityPlayerToBallReward(RewardFunction):
+    """
+    A reward function that rewards a player based on their velocity towards the ball,
+    using either a regular dot product or a scalar projection to determine the reward.
+    """
     def __init__(self, use_scalar_projection=False):
         super().__init__()
         self.use_scalar_projection = use_scalar_projection
@@ -1932,7 +2435,8 @@ class VelocityPlayerToBallReward(RewardFunction):
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         vel = player.car_data.linear_velocity
         pos_diff = state.ball.position - player.car_data.position
         if self.use_scalar_projection:
@@ -1941,14 +2445,17 @@ class VelocityPlayerToBallReward(RewardFunction):
             # Used to guide the agent towards the ball
             inv_t = math.scalar_projection(vel, pos_diff)
             return inv_t
-        else:
-            # Regular component velocity
-            norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
-            norm_vel = vel / CAR_MAX_SPEED
-            return float(np.dot(norm_pos_diff, norm_vel))
+
+        # Regular component velocity
+        norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
+        norm_vel = vel / CAR_MAX_SPEED
+        return float(np.dot(norm_pos_diff, norm_vel))
 
 class VelocityReward(RewardFunction):
-    # Simple reward function to ensure the model is training.
+    """
+    A simple reward function based on the player's velocity,
+    either rewarding or penalizing based on the velocity.
+    """
     def __init__(self, negative=False):
         super().__init__()
         self.negative = negative
@@ -1956,10 +2463,16 @@ class VelocityReward(RewardFunction):
     def reset(self, initial_state: GameState):
         pass
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
-        return np.linalg.norm(player.car_data.linear_velocity) / CAR_MAX_SPEED * (1 - 2 * self.negative)
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
+        velocity = np.linalg.norm(player.car_data.linear_velocity)
+        return velocity / CAR_MAX_SPEED * (1 - 2 * self.negative)
 
 class VersatileBallVelocityReward(RewardFunction):
+    """
+    A composite reward function that adapts based on whether the player is on offense or defense,
+    utilizing offensive and defensive velocity rewards for the ball.
+    """
     def __init__(self):
         super().__init__()
         self.offensive_reward = VelocityBallToGoalReward()
@@ -1975,14 +2488,18 @@ class VersatileBallVelocityReward(RewardFunction):
             player.team_num == ORANGE_TEAM and state.ball.position[1] > 0
         ):
             return self.defensive_reward.get_reward(player, state, previous_action)
-        else:
-            return self.offensive_reward.get_reward(player, state, previous_action)
+
+        return self.offensive_reward.get_reward(player, state, previous_action)
 
 class WallTouchReward(RewardFunction):
+    """
+    A reward function that rewards players for touching the ball while it is above a certain height,
+    typically when it makes contact with the wall during a game.
+    """
     def __init__(self, min_height=92, exp=0.2):
         self.min_height = min_height
         self.exp = exp
-        self.max = math.inf
+        self.max = float('inf')
 
     def reset(self, initial_state: GameState):
         pass
@@ -1996,6 +2513,10 @@ class WallTouchReward(RewardFunction):
         return 0
 
 class ZeroSumReward(RewardFunction):
+    """
+    A reward function that calculates rewards for each player using a zero-sum approach,
+    considering team rewards, individual rewards, and penalties based on opponent performance.
+    """
     '''
     child_reward: The underlying reward function
     team_spirit: How much to share this reward with teammates (0-1)
@@ -2023,10 +2544,12 @@ class ZeroSumReward(RewardFunction):
 
         '''
         Each player's reward is calculated using this equation:
-        reward = individual_rewards * (1-team_spirit) + avg_team_reward * team_spirit - avg_opp_reward * opp_scale
+        reward = individual_rewards * (1-team_spirit) + avg_team_reward
+        * team_spirit - avg_opp_reward * opp_scale
         '''
 
-        # Get the individual rewards from each player while also adding them to that team's reward list
+        # Get the individual rewards from each player while also adding
+        # them to that team's reward list
         individual_rewards = {}
         team_reward_lists = [ [], [] ]
         for player in state.players:
@@ -2037,7 +2560,8 @@ class ZeroSumReward(RewardFunction):
             individual_rewards[player.car_id] = reward
             team_reward_lists[int(player.team_num)].append(reward)
 
-        # If a team has no players, add a single 0 to their team rewards so the average doesn't break
+        # If a team has no players, add a single 0 to their team rewards
+        # so the average doesn't break
         for i in range(2):
             if len(team_reward_lists[i]) == 0:
                 team_reward_lists[i].append(0)
@@ -2063,16 +2587,22 @@ class ZeroSumReward(RewardFunction):
     I made get_reward and get_final_reward both call get_reward_multi, using the "is_final" argument to distinguish
     Otherwise I would have to rewrite this function for final rewards, which is lame
     '''
-    def get_reward_multi(self, player: PlayerData, state: GameState, previous_action: np.ndarray, is_final) -> float:
-        # If this is the first get_reward call this step, we need to update the rewards for all players
+    def get_reward_multi(
+        self, player: PlayerData, state: GameState, previous_action: np.ndarray, is_final
+    ) -> float:
+        # If this is the first get_reward call this step,
+        # we need to update the rewards for all players
         if self._update_next:
             self.update(state, is_final)
             self._update_next = False
         return self._rewards_cache[player.car_id]
 
-    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_reward(
+        self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         return self.get_reward_multi(player, state, previous_action, False)
 
-    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+    def get_final_reward(
+        self, player: PlayerData, state: GameState, previous_action: np.ndarray
+    ) -> float:
         return self.get_reward_multi(player, state, previous_action, True)
-    
